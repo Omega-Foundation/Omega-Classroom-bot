@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy import text
 from app.config import Config
 
 Base = declarative_base()
@@ -18,6 +19,9 @@ class User(Base):
     last_name = Column(String(255))
     github_username = Column(String(255))
     github_token = Column(String(500))  # Store GitHub personal access token
+    # Per-user notification settings (override app defaults if set)
+    notify_threshold_hours = Column(Integer)  # if None, fallback to app settings
+    notify_period_seconds = Column(Integer)   # if None, fallback to app settings
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
@@ -81,6 +85,11 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db():
     """Initialize the database by creating all tables."""
     Base.metadata.create_all(bind=engine)
+    try:
+        _migrate_user_notification_columns()
+    except Exception as e:
+        # Non-fatal: log and continue
+        print(f"Migration check failed: {e}")
 
 def get_db():
     """Get database session."""
@@ -89,4 +98,48 @@ def get_db():
         yield db
     finally:
         db.close()
+
+class AppSettings(Base):
+    """Global application settings for notifications."""
+    __tablename__ = 'app_settings'
+
+    id = Column(Integer, primary_key=True)
+    notify_threshold_hours = Column(Integer, default=Config.DEADLINE_WARNING_HOURS)
+    notify_period_seconds = Column(Integer, default=Config.NOTIFICATION_CHECK_INTERVAL)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+def get_or_create_settings(db: 'Session') -> 'AppSettings':
+    settings = db.query(AppSettings).get(1)
+    if not settings:
+        settings = AppSettings(id=1)
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    return settings
+
+def _migrate_user_notification_columns():
+    """Ensure new user notification columns exist (best-effort, idempotent)."""
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        if dialect == 'postgresql':
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_threshold_hours INTEGER"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_period_seconds INTEGER"))
+        elif dialect == 'sqlite':
+            # Check existing columns
+            res = conn.execute(text("PRAGMA table_info('users')"))
+            cols = {row[1] for row in res.fetchall()}
+            if 'notify_threshold_hours' not in cols:
+                conn.execute(text("ALTER TABLE users ADD COLUMN notify_threshold_hours INTEGER"))
+            if 'notify_period_seconds' not in cols:
+                conn.execute(text("ALTER TABLE users ADD COLUMN notify_period_seconds INTEGER"))
+        else:
+            # Attempt generic approach
+            try:
+                conn.execute(text("ALTER TABLE users ADD COLUMN notify_threshold_hours INTEGER"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE users ADD COLUMN notify_period_seconds INTEGER"))
+            except Exception:
+                pass
 

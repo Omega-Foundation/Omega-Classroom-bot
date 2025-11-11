@@ -73,6 +73,8 @@ class HomeworkTrackerBot:
             "/register_token <token> - Register your GitHub personal access token\n"
             "/assignments - List all your assignments\n"
             "/add_assignment - Add a new assignment to track\n"
+            "/set_my_notify_threshold <days> - Start notifications N days before deadline (you)\n"
+            "/set_my_notify_period <value><m|h> - Reminder interval for you (e.g. 60m, 1h)\n"
             "/delete_assignment - Delete an assignment\n"
             "/help - Show this help message\n"
         )
@@ -129,79 +131,157 @@ class HomeworkTrackerBot:
                 )
         finally:
             db.close()
-    
+
     async def list_assignments(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /assignments command - get assignments from GitHub Classroom API."""
         chat_id = update.effective_chat.id
-        
+
         db = self.get_db()
         try:
             db_user = db.query(User).filter(User.telegram_id == chat_id).first()
-            
+
             if not db_user:
                 await update.message.reply_text("Please use /start first.")
                 return
-            
+
             if not db_user.github_token:
                 await update.message.reply_text(
                     "Please register your GitHub token first:\n"
                     "/register_token <your_github_token>"
                 )
                 return
-            
-            # Get assignments from GitHub Classroom API
-            message = ""
-            classroom_assignments = []
-            try:
-                github_client = GitHubClient(token=db_user.github_token)
-                classroom_assignments = github_client.get_classroom_assignments()
-                
-                if classroom_assignments:
-                    message = "📋 Assignments from GitHub Classroom\n\n"
-                    for i, assignment in enumerate(classroom_assignments[:10], 1):  # Limit to 10
-                        message += (
-                            f"{i}. {assignment['name']}\n"
-                            f"   URL: {assignment['url']}\n"
-                            f"   Description: {assignment.get('description', 'N/A')}\n\n"
-                        )
-                    
-                    if len(classroom_assignments) > 10:
-                        message += f"... and {len(classroom_assignments) - 10} more assignments\n\n"
-            except Exception as e:
-                message = f"⚠️ Could not fetch assignments from GitHub Classroom:\n{str(e)}\n\n"
-            
-            # Also show user's saved assignments with deadlines
+
+            # Build a unified map keyed by normalized name to dedupe
+            entries_map = {}
+
+            def add_or_merge(name: str, deadline: datetime, url: str):
+                if not name:
+                    return
+                key = name.strip().lower()
+                current = entries_map.get(key)
+                if current is None:
+                    entries_map[key] = {
+                        'name': name.strip().strip('"'),
+                        'deadline': deadline,
+                        'url': url or ''
+                    }
+                else:
+                    # Prefer existing deadline if present; otherwise take new
+                    print(f"Current: {current}")
+                    if not isinstance(current.get('deadline'), datetime) and isinstance(deadline, datetime):
+                        current['deadline'] = deadline
+                    # Prefer non-empty URL, classroom URL wins if saved was missing
+                    if (not current.get('url')) or current.get('url') in ('N/A', ''):
+                        if url:
+                            current['url'] = url
+
+            # Saved assignments first
             saved_assignments = db.query(Assignment).filter(
                 Assignment.user_id == db_user.id
             ).order_by(Assignment.deadline).all()
-            
-            if saved_assignments:
-                message += "📋 Your Saved Assignments (with Deadlines)\n\n"
-                for assignment in saved_assignments:
-                    status = "✅ Past" if assignment.deadline < datetime.utcnow() else "⏰ Active"
-                    time_remaining = ""
-                    if assignment.deadline > datetime.utcnow():
-                        delta = assignment.deadline - datetime.utcnow()
-                        days = delta.days
-                        hours = delta.seconds // 3600
-                        time_remaining = f" ({days}d {hours}h remaining)"
-                    
-                    message += (
-                        f"{status} {assignment.name}\n"
-                        f"Deadline: {assignment.deadline.strftime('%Y-%m-%d %H:%M:%S UTC')}{time_remaining}\n"
-                        f"Repository: {assignment.github_repo_url or assignment.github_repo_name}\n\n"
-                    )
-            
-            if not message or (not classroom_assignments and not saved_assignments):
+            for a in saved_assignments:
+                saved_url = a.github_repo_url or a.github_repo_name or ''
+                add_or_merge(a.name, a.deadline, saved_url)
+
+            # Classroom assignments (also auto-save if missing)
+            try:
+                github_client = GitHubClient(token=db_user.github_token)
+                classroom_assignments = github_client.get_classroom_assignments(db_user.github_username or '')
+                for ca in classroom_assignments:
+                    # Normalize deadline
+                    raw_deadline = ca.get('deadline')
+                    deadline_val = None
+                    if isinstance(raw_deadline, datetime):
+                        if raw_deadline.tzinfo is not None:
+                            deadline_val = raw_deadline.astimezone(timezone.utc).replace(tzinfo=None)
+                        else:
+                            deadline_val = raw_deadline
+
+                    # Auto-save if not exists by exact name
+                    name_val = ca.get('name') or ''
+                    repo_url_val = ca.get('url') or ''
+                    try:
+                        exists = db.query(Assignment).filter(
+                            and_(Assignment.user_id == db_user.id, Assignment.name == name_val)
+                        ).first()
+                        if not exists:
+                            repo_name = ''
+                            if repo_url_val:
+                                try:
+                                    repo_name = GitHubClient(token=db_user.github_token).parse_repo_url(repo_url_val) or ''
+                                except Exception:
+                                    repo_name = ''
+                            new_a = Assignment(
+                                name=name_val or 'Classroom Assignment',
+                                description=ca.get('description'),
+                                github_repo_name=repo_name,
+                                github_repo_url=repo_url_val,
+                                deadline=deadline_val or datetime.utcnow(),
+                                user_id=db_user.id
+                            )
+                            db.add(new_a)
+                            db.commit()
+                        else:
+                            # Update missing URL or deadline from classroom info
+                            changed = False
+                            if (not exists.github_repo_url) and repo_url_val:
+                                exists.github_repo_url = repo_url_val
+                                # backfill repo name if empty
+                                if not exists.github_repo_name:
+                                    try:
+                                        exists.github_repo_name = GitHubClient(token=db_user.github_token).parse_repo_url(repo_url_val) or ''
+                                    except Exception:
+                                        pass
+                                changed = True
+                            if (not isinstance(exists.deadline, datetime)) and isinstance(deadline_val, datetime):
+                                exists.deadline = deadline_val
+                                changed = True
+                            if changed:
+                                db.commit()
+                    except Exception:
+                        pass
+
+                    add_or_merge(name_val, deadline_val, repo_url_val)
+            except Exception:
+                pass
+
+            entries = list(entries_map.values())
+
+            if not entries:
                 await update.message.reply_text(
                     "No assignments found.\n"
                     "You can add assignments with: /add_assignment"
                 )
             else:
-                await update.message.reply_text(message)
+                # Render unified list
+                out = ""
+                # sort by deadline ascending if available
+                try:
+                    entries.sort(key=lambda x: x['deadline'] or datetime.max)
+                except Exception:
+                    pass
+                for e in entries:
+                    status = "✅ Past"
+                    time_remaining = ""
+                    if isinstance(e.get('deadline'), datetime):
+                        if e['deadline'] > datetime.utcnow():
+                            status = "⏰ Active"
+                            delta = e['deadline'] - datetime.utcnow()
+                            days = delta.days
+                            hours = delta.seconds // 3600
+                            time_remaining = f" ({days}d {hours}h remaining)"
+                    name_show = (e.get('name') or 'N/A').strip('"')
+                    out += f"{status} \"{name_show}\"\n\n"
+                    if isinstance(e.get('deadline'), datetime):
+                        out += f"Deadline: {e['deadline'].strftime('%Y-%m-%d %H:%M:%S UTC')}{time_remaining}\n\n"
+                    else:
+                        out += f"Deadline: N/A\n\n"
+                    repo_out = e.get('url') or 'N/A'
+                    out += f"Repository: {repo_out}\n\n"
+                await update.message.reply_text(out)
         finally:
             db.close()
-    
+
     async def add_assignment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /add_assignment command - user provides repo link and deadline."""
         chat_id = update.effective_chat.id
@@ -353,6 +433,70 @@ class HomeworkTrackerBot:
         finally:
             db.close()
 
+    async def set_my_notify_threshold(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /set_my_notify_threshold <days> to control when your reminders start."""
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            if not context.args:
+                await update.message.reply_text(
+                    "Usage: /set_my_notify_threshold <days>\n"
+                    "Example: /set_my_notify_threshold 7"
+                )
+                return
+            try:
+                days = int(context.args[0])
+                if days < 0:
+                    raise ValueError()
+            except ValueError:
+                await update.message.reply_text("Days must be a non-negative integer.")
+                return
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+            db_user.notify_threshold_hours = days * 24
+            db.commit()
+            await update.message.reply_text(
+                f"✅ Your notification threshold set to {days} day(s) before deadline."
+            )
+        finally:
+            db.close()
+
+    async def set_my_notify_period(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /set_my_notify_period <value><m|h> to control your reminder frequency."""
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            if not context.args:
+                await update.message.reply_text(
+                    "Usage: /set_my_notify_period <value><m|h>\n"
+                    "Examples: /set_my_notify_period 60m, /set_my_notify_period 1h"
+                )
+                return
+            token = context.args[0].strip().lower()
+            import re
+            m = re.match(r"^(\d+)(m|h)$", token)
+            if not m:
+                await update.message.reply_text(
+                    "Invalid format. Use <value><m|h>, e.g. 30m or 2h."
+                )
+                return
+            value = int(m.group(1))
+            unit = m.group(2)
+            seconds = value * 60 if unit == 'm' else value * 3600
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+            db_user.notify_period_seconds = seconds
+            db.commit()
+            await update.message.reply_text(
+                f"✅ Your notification period set to {value}{unit}."
+            )
+        finally:
+            db.close()
+
 def main():
     """Main function to run the bot."""
     # Validate configuration
@@ -378,6 +522,8 @@ def main():
     application.add_handler(CommandHandler("assignments", bot_instance.list_assignments))
     application.add_handler(CommandHandler("add_assignment", bot_instance.add_assignment))
     application.add_handler(CommandHandler("delete_assignment", bot_instance.delete_assignment))
+    application.add_handler(CommandHandler("set_my_notify_threshold", bot_instance.set_my_notify_threshold))
+    application.add_handler(CommandHandler("set_my_notify_period", bot_instance.set_my_notify_period))
     
     # Start the bot
     print("Bot is starting...")

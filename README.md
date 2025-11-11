@@ -8,9 +8,6 @@ A Telegram bot for tracking assignments in GitHub Classroom. It automatically mo
 - 🔔 **Automatic Notifications**: 
   - Students receive reminders about upcoming deadlines
   - Teachers receive reports about unsubmitted assignments
-- 🔍 **GitHub Integration**: Automatically checks student repository activity
-- 📊 **Submission Tracking**: Monitor student submissions and commit activity
-- 👥 **Role Management**: Separate interfaces for students and teachers
 
 ## Setup
 
