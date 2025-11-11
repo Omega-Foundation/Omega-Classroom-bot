@@ -1,0 +1,2 @@
+"""Omega Classroom Bot Application."""
+

@@ -1,0 +1,15 @@
+# Example override file for local development
+# Copy this to docker-compose.override.yml and customize as needed
+# Note: File name uses hyphen, but use "docker compose" command (not "docker-compose")
+version: '3.8'
+
+services:
+  db:
+    ports:
+      - "5432:5432"
+  
+  bot:
+    volumes:
+      - ./app:/app/app
+      - ./.env:/app/.env
+

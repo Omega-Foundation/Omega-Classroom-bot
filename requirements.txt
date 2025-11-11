@@ -1,0 +1,9 @@
+python-telegram-bot==20.7
+PyGithub==1.59.1
+SQLAlchemy==2.0.23
+python-dotenv==1.0.0
+apscheduler==3.10.4
+requests==2.31.0
+python-dateutil==2.8.2
+psycopg2-binary==2.9.9
+

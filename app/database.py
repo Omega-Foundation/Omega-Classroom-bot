@@ -1,0 +1,92 @@
+"""Database models and connection handling."""
+from datetime import datetime
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from app.config import Config
+
+Base = declarative_base()
+
+class User(Base):
+    """Telegram user model."""
+    __tablename__ = 'users'
+    
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, unique=True, nullable=False, index=True)
+    username = Column(String(255))
+    first_name = Column(String(255))
+    last_name = Column(String(255))
+    github_username = Column(String(255))
+    github_token = Column(String(500))  # Store GitHub personal access token
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    assignments = relationship('Assignment', back_populates='user')
+    submissions = relationship('Submission', back_populates='user')
+
+class Assignment(Base):
+    """Assignment model."""
+    __tablename__ = 'assignments'
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False)
+    description = Column(Text)
+    github_repo_name = Column(String(255), nullable=False)
+    github_repo_url = Column(String(500))
+    deadline = Column(DateTime, nullable=False)
+    classroom_id = Column(String(255))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    user_id = Column(Integer, ForeignKey('users.id'))
+    user = relationship('User', back_populates='assignments')
+    submissions = relationship('Submission', back_populates='assignment', cascade='all, delete-orphan')
+
+class Submission(Base):
+    """Student submission tracking model."""
+    __tablename__ = 'submissions'
+    
+    id = Column(Integer, primary_key=True)
+    assignment_id = Column(Integer, ForeignKey('assignments.id'), nullable=False)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    github_repo_url = Column(String(500))
+    last_commit_sha = Column(String(255))
+    last_commit_date = Column(DateTime)
+    is_submitted = Column(Boolean, default=False)
+    submitted_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    assignment = relationship('Assignment', back_populates='submissions')
+    user = relationship('User', back_populates='submissions')
+
+class Notification(Base):
+    """Notification tracking model."""
+    __tablename__ = 'notifications'
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    assignment_id = Column(Integer, ForeignKey('assignments.id'))
+    notification_type = Column(String(50), nullable=False)  # 'deadline_warning', 'unsubmitted', etc.
+    message = Column(Text)
+    sent_at = Column(DateTime, default=datetime.utcnow)
+    is_read = Column(Boolean, default=False)
+
+# Database setup
+engine = create_engine(Config.get_database_url(), echo=False)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def init_db():
+    """Initialize the database by creating all tables."""
+    Base.metadata.create_all(bind=engine)
+
+def get_db():
+    """Get database session."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
