@@ -3,7 +3,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import joinedload
-from app.database import User, Assignment, TrackedRepository, Submission, get_db, init_db
+from app.database import User, Assignment, TrackedRepository, Submission, ClassroomAssignmentRecord, get_db, init_db
 from app.github_client import GitHubClient
 from datetime import datetime, timezone
 from app.config import Config
@@ -11,9 +11,10 @@ from dateutil import parser as date_parser
 from io import BytesIO
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
-from typing import Tuple, List, Dict, Optional, Set
+from typing import Tuple, List, Dict, Optional
 from collections import Counter
 import re
+import json
 
 class HomeworkTrackerBot:
     """Main bot class."""
@@ -281,6 +282,53 @@ class HomeworkTrackerBot:
 
         db.commit()
 
+    def _store_classroom_records(
+        self,
+        db,
+        teacher: User,
+        records: List[Dict]
+    ):
+        """Persist classroom assignment snapshot records for a teacher."""
+        if not teacher or not isinstance(records, list):
+            return
+        teacher_id = teacher.id
+        if not teacher_id:
+            return
+        db.query(ClassroomAssignmentRecord).filter(
+            ClassroomAssignmentRecord.teacher_user_id == teacher_id
+        ).delete()
+        for record in records:
+            try:
+                deadline = record.get('deadline')
+                if isinstance(deadline, str):
+                    deadline = self._parse_datetime(deadline)
+                raw_payload = record.get('raw')
+                if raw_payload is not None:
+                    raw_json = json.dumps(raw_payload, default=str)
+                else:
+                    raw_json = None
+                classroom_record = ClassroomAssignmentRecord(
+                    teacher_user_id=teacher_id,
+                    classroom_id=str(record.get('classroom_id') or ''),
+                    classroom_name=record.get('classroom_name') or '',
+                    assignment_id=str(record.get('assignment_id') or ''),
+                    assignment_title=record.get('assignment_title') or '',
+                    assignment_url=record.get('assignment_url') or '',
+                    deadline=deadline,
+                    student_login=record.get('student_login') or '',
+                    student_display_login=record.get('student_display_login') or '',
+                    student_repo_url=record.get('student_repo_url') or '',
+                    submitted=record.get('submitted'),
+                    passed=record.get('passed'),
+                    grade=record.get('grade'),
+                    commit_count=record.get('commit_count'),
+                    raw_json=raw_json,
+                )
+                db.add(classroom_record)
+            except Exception as exc:
+                print(f"Failed to persist classroom record: {exc}")
+        db.commit()
+
     def get_db(self):
         """Get database session."""
         db_gen = get_db()
@@ -477,13 +525,15 @@ class HomeworkTrackerBot:
                 .all()
             )
 
-            if not assignments:
-                await update.message.reply_text(
-                    "No assignments found.\n"
-                    "You can add assignments with: /add_assignment"
-                )
-            else:
-                lines: List[str] = []
+            entries: List[Dict] = []
+            username_lower = db_user.github_username.lower()
+
+            def add_entry(data: Dict):
+                entries.append(data)
+
+            seen_keys = set()
+
+            if assignments:
                 now = datetime.utcnow()
                 for assignment in assignments:
                     submission = next((s for s in assignment.submissions or [] if s.user_id == db_user.id), None)
@@ -495,34 +545,114 @@ class HomeworkTrackerBot:
                     if submission and submission.github_repo_url:
                         repo_url = submission.github_repo_url
 
-                    status = "✅ Past"
+                    deadline = assignment.deadline if isinstance(assignment.deadline, datetime) else None
+                    status = "ℹ️"
                     time_remaining = ""
-                    if isinstance(assignment.deadline, datetime):
-                        deadline = assignment.deadline
+                    if deadline:
                         if deadline > now:
                             status = "⏰ Active"
                             delta = deadline - now
-                            days = delta.days
-                            hours = delta.seconds // 3600
-                            time_remaining = f" ({days}d {hours}h remaining)"
+                            time_remaining = f" ({delta.days}d {delta.seconds // 3600}h remaining)"
                         else:
                             status = "✅ Past"
-                    else:
-                        deadline = None
-                        status = "ℹ️"
 
-                    lines.append(f"{status} \"{assignment.name}\"")
-                    if deadline:
-                        lines.append(f"Deadline: {deadline.strftime('%Y-%m-%d %H:%M:%S UTC')}{time_remaining}")
+                    submission_status = None
+                    submitted_at_str = None
+                    if submission:
+                        submission_status = "Submitted" if submission.is_submitted else "In progress"
+                        if submission.submitted_at:
+                            submitted_at = submission.submitted_at
+                            if isinstance(submitted_at, datetime):
+                                submitted_at_str = submitted_at.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+                    key = (assignment.classroom_assignment_id or assignment.id or assignment.name, teacher_name)
+                    seen_keys.add(key)
+
+                    add_entry({
+                        'name': assignment.name,
+                        'deadline': deadline,
+                        'repo_url': repo_url,
+                        'teacher': teacher_name,
+                        'status': status,
+                        'time_remaining': time_remaining,
+                        'submission_status': submission_status,
+                        'submitted_at': submitted_at_str,
+                        'source': 'Submission',
+                    })
+
+            classroom_records = (
+                db.query(ClassroomAssignmentRecord)
+                .options(joinedload(ClassroomAssignmentRecord.teacher))
+                .filter(
+                    or_(
+                        func.lower(ClassroomAssignmentRecord.student_login) == username_lower,
+                        func.lower(ClassroomAssignmentRecord.student_display_login) == username_lower
+                    )
+                )
+                .order_by(ClassroomAssignmentRecord.deadline, ClassroomAssignmentRecord.assignment_title)
+                .all()
+            )
+
+            for record in classroom_records:
+                teacher = record.teacher
+                teacher_name = ""
+                if teacher:
+                    teacher_name = teacher.first_name or teacher.username or teacher.github_username or ""
+                key = (record.assignment_id or record.assignment_title, teacher_name)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                repo_url = record.student_repo_url or record.assignment_url or ''
+                deadline = record.deadline if isinstance(record.deadline, datetime) else None
+                status = "ℹ️"
+                time_remaining = ""
+                if deadline:
+                    if deadline > datetime.utcnow():
+                        delta = deadline - datetime.utcnow()
+                        status = "⏰ Active"
+                        time_remaining = f" ({delta.days}d {delta.seconds // 3600}h remaining)"
+                    else:
+                        status = "✅ Past"
+
+                submission_status = None
+                if record.submitted is not None:
+                    submission_status = "Submitted" if record.submitted else "In progress"
+
+                add_entry({
+                    'name': record.assignment_title or 'Classroom Assignment',
+                    'deadline': deadline,
+                    'repo_url': repo_url,
+                    'teacher': teacher_name,
+                    'status': status,
+                    'time_remaining': time_remaining,
+                    'submission_status': submission_status,
+                    'submitted_at': None,
+                    'source': 'Classroom Snapshot',
+                })
+
+            if not entries:
+                await update.message.reply_text(
+                    "No assignments found.\n"
+                    "You can add assignments with: /add_assignment"
+                )
+            else:
+                entries.sort(key=lambda e: (e['deadline'] or datetime.max, e['name']))
+                lines: List[str] = []
+                for entry in entries:
+                    lines.append(f"{entry['status']} \"{entry['name']}\"")
+                    if entry['deadline']:
+                        lines.append(f"Deadline: {entry['deadline'].strftime('%Y-%m-%d %H:%M:%S UTC')}{entry['time_remaining']}")
                     else:
                         lines.append("Deadline: N/A")
-                    lines.append(f"Repository: {repo_url or 'N/A'}")
-                    if teacher_name:
-                        lines.append(f"Teacher: {teacher_name}")
-                    if submission:
-                        lines.append(f"Submission status: {'Submitted' if submission.is_submitted else 'In progress'}")
-                        if submission.submitted_at:
-                            lines.append(f"Submitted at: {submission.submitted_at.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                    lines.append(f"Repository: {entry['repo_url'] or 'N/A'}")
+                    if entry['teacher']:
+                        lines.append(f"Teacher: {entry['teacher']}")
+                    if entry['submission_status']:
+                        lines.append(f"Submission status: {entry['submission_status']}")
+                    if entry['submitted_at']:
+                        lines.append(f"Submitted at: {entry['submitted_at']}")
+                    lines.append(f"Source: {entry['source']}")
                     lines.append("")
 
                 await update.message.reply_text("\n".join(lines).strip())
@@ -863,6 +993,7 @@ class HomeworkTrackerBot:
                 return
 
             matched_sections = []
+            records_payload: List[Dict] = []
 
             for classroom in classrooms:
                 class_name = classroom.get('name') or f"Classroom #{classroom.get('id')}"
@@ -886,11 +1017,12 @@ class HomeworkTrackerBot:
 
                 for assignment in assignments:
                     title = assignment.get('title') or 'Без названия'
-                    deadline = assignment.get('deadline')
-                    if isinstance(deadline, datetime):
-                        deadline_str = deadline.strftime('%Y-%m-%d %H:%M UTC')
-                    elif isinstance(deadline, str):
-                        deadline_str = deadline
+                    raw_deadline = assignment.get('deadline')
+                    deadline_dt = self._parse_datetime(raw_deadline)
+                    if deadline_dt:
+                        deadline_str = deadline_dt.strftime('%Y-%m-%d %H:%M UTC')
+                    elif isinstance(raw_deadline, str):
+                        deadline_str = raw_deadline
                     else:
                         deadline_str = 'N/A'
 
@@ -910,16 +1042,53 @@ class HomeworkTrackerBot:
 
                     if not accepted:
                         section_lines.append("   Никто ещё не начал выполнение.")
+                        records_payload.append({
+                            'classroom_id': classroom_id,
+                            'classroom_name': class_name,
+                            'assignment_id': assignment.get('id'),
+                            'assignment_title': title,
+                            'deadline': deadline_dt,
+                            'student_login': '',
+                            'student_display_login': '',
+                            'student_repo_url': '',
+                            'submitted': None,
+                            'passed': None,
+                            'grade': None,
+                            'commit_count': None,
+                            'assignment_url': assignment.get('student_repository_url') or assignment.get('invitations_url') or '',
+                            'raw': assignment,
+                        })
                         continue
 
                     for acceptance in accepted:
-                        login, repo_url, _ = self._extract_student_identity(assignment, acceptance)
+                        login, repo_url, canonical_login = self._extract_student_identity(assignment, acceptance)
                         submitted = acceptance.get('submitted') or False
                         status_icon = "✅" if submitted else "⏳"
                         repo_text = f" – {repo_url}" if repo_url else ""
                         section_lines.append(f"   {status_icon} {login}{repo_text}")
+                        records_payload.append({
+                            'classroom_id': classroom_id,
+                            'classroom_name': class_name,
+                            'assignment_id': assignment.get('id'),
+                            'assignment_title': title,
+                            'deadline': deadline_dt,
+                            'student_login': canonical_login or login,
+                            'student_display_login': login,
+                            'student_repo_url': repo_url,
+                            'submitted': bool(submitted),
+                            'passed': acceptance.get('passed'),
+                            'grade': acceptance.get('grade'),
+                            'commit_count': acceptance.get('commit_count'),
+                            'assignment_url': repo_url or assignment.get('student_repository_url') or assignment.get('invitations_url') or '',
+                            'raw': acceptance,
+                        })
 
                 matched_sections.append('\n'.join(section_lines))
+
+            try:
+                self._store_classroom_records(db, db_user, records_payload)
+            except Exception as store_err:
+                print(f"Failed to store classroom snapshot: {store_err}")
 
             if not matched_sections:
                 await update.message.reply_text(

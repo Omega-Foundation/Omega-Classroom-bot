@@ -29,6 +29,8 @@ class User(Base):
     assignments = relationship('Assignment', back_populates='user')
     submissions = relationship('Submission', back_populates='user')
     ci_repositories = relationship('TrackedRepository', back_populates='user', cascade='all, delete-orphan')
+    classroom_records = relationship('ClassroomAssignmentRecord', back_populates='teacher', cascade='all, delete-orphan')
+    ci_repositories = relationship('TrackedRepository', back_populates='user', cascade='all, delete-orphan')
 
 class Assignment(Base):
     """Assignment model."""
@@ -93,6 +95,30 @@ class Notification(Base):
     message = Column(Text)
     sent_at = Column(DateTime, default=datetime.utcnow)
     is_read = Column(Boolean, default=False)
+
+class ClassroomAssignmentRecord(Base):
+    """Snapshot records of classroom assignments fetched for teachers."""
+    __tablename__ = 'classroom_assignment_records'
+    
+    id = Column(Integer, primary_key=True)
+    teacher_user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    classroom_id = Column(String(255))
+    classroom_name = Column(String(255))
+    assignment_id = Column(String(255))
+    assignment_title = Column(String(255))
+    assignment_url = Column(String(500))
+    deadline = Column(DateTime)
+    student_login = Column(String(255))
+    student_display_login = Column(String(255))
+    student_repo_url = Column(String(500))
+    submitted = Column(Boolean)
+    passed = Column(Boolean)
+    grade = Column(String(255))
+    commit_count = Column(Integer)
+    raw_json = Column(Text)
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+    
+    teacher = relationship('User', back_populates='classroom_records')
 
 # Database setup
 engine = create_engine(Config.get_database_url(), echo=False)
