@@ -131,6 +131,7 @@ docker compose exec db psql -U postgres -d omega_classroom  # Access database
 5. **View your assignments**: `/assignments`
    - Lists all assignments you've added
    - Shows deadline and time remaining
+   - Classroom assignments synced by your teacher appear automatically when your GitHub username is set
 
 6. **Teacher-only** – Add an assignment: `/add_assignment <name> <repo_link> <deadline>`
    - Example: `/add_assignment "Homework 1" https://github.com/org/repo "Nov 11, 2025, 22:33 UTC"`
@@ -143,7 +144,17 @@ docker compose exec db psql -U postgres -d omega_classroom  # Access database
    - Deletes the assignment and stops monitoring it
    - Use `/assignments` to see your assignments
 
-8. **Get help**: `/help`
+8. **Teacher-only** – Export classroom data: `/export_assignments_excel [classroom_filter]`
+   - Generates an Excel workbook with per-student details and a summary sheet
+   - Optional argument filters classrooms by name substring
+
+9. **Teacher-only** – Export users report: `/export_users_excel`
+   - Produces an Excel workbook with all registered users, their roles, GitHub linkage, and activity stats
+
+10. **Teacher-only** – Dump submissions table: `/dump_submissions`
+    - Prints every row from `submissions` with all column values (debugging/administration)
+
+11. **Get help**: `/help`
    - Shows all available commands
 
 ## Database Schema

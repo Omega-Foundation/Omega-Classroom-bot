@@ -41,6 +41,7 @@ class Assignment(Base):
     github_repo_url = Column(String(500))
     deadline = Column(DateTime, nullable=False)
     classroom_id = Column(String(255))
+    classroom_assignment_id = Column(String(255))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -103,6 +104,7 @@ def init_db():
     try:
         _migrate_user_notification_columns()
         _migrate_user_role_column()
+        _migrate_assignment_classroom_columns()
     except Exception as e:
         # Non-fatal: log and continue
         print(f"Migration check failed: {e}")
@@ -173,5 +175,22 @@ def _migrate_user_role_column():
         else:
             try:
                 conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'student' NOT NULL"))
+            except Exception:
+                pass
+
+def _migrate_assignment_classroom_columns():
+    """Ensure assignment classroom-related columns exist."""
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        if dialect == 'postgresql':
+            conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS classroom_assignment_id VARCHAR(255)"))
+        elif dialect == 'sqlite':
+            res = conn.execute(text("PRAGMA table_info('assignments')"))
+            cols = {row[1] for row in res.fetchall()}
+            if 'classroom_assignment_id' not in cols:
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN classroom_assignment_id VARCHAR(255)"))
+        else:
+            try:
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN classroom_assignment_id VARCHAR(255)"))
             except Exception:
                 pass

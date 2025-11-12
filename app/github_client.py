@@ -109,6 +109,7 @@ class GitHubClient:
                 assignments.append({
                     'id': assignment.get('id'),
                     'title': assignment.get('title'),
+                    'slug': assignment.get('slug'),
                     'description': assignment.get('description'),
                     'deadline': deadline,
                     'student_repository_url': assignment.get('student_repository_url'),
@@ -121,6 +122,7 @@ class GitHubClient:
                     'language': assignment.get('language'),
                     'starter_code_repository': assignment.get('starter_code_repository', {}),
                     'classroom': assignment.get('classroom', {}),
+                    'accepted_assignments_url': assignment.get('accepted_assignments_url'),
                 })
         except Exception as e:
             print(f"Exception getting assignments for classroom {classroom_id}: {e}")
@@ -175,6 +177,8 @@ class GitHubClient:
             - url: invitations_url (if available)
             - description: assignment description
             - classroom_id, classroom_name for reference
+            - participant: True if the provided github_username is matched to this assignment
+            - matched_username: The username matched (if any)
         """
         flat: List[Dict] = []
         classrooms = self.get_all_classrooms()
@@ -185,6 +189,8 @@ class GitHubClient:
             for a in assignments:
                 # Resolve per-user repository URL via grades endpoint if username provided
                 repo_url = ''
+                participant = False
+                matched_username = ''
                 if github_username:
                     grades = self._get_assignment_grades(a.get('id'))
                     for g in grades:
@@ -200,18 +206,27 @@ class GitHubClient:
                                 or (isinstance(g.get('repository'), dict) and (g['repository'].get('html_url') or g['repository'].get('url')))
                                 or ''
                             )
+                            matched_username = u
+                            participant = bool(repo_url)
                             break
                 # Fallbacks if grades did not yield a repo URL
                 if not repo_url:
                     sr = a.get('student_repository_url')
                     if isinstance(sr, str):
                         repo_url = sr
+                        if github_username and github_username.lower() in sr.lower():
+                            participant = True
+                            matched_username = github_username
                 if not repo_url:
                     repo_obj = a.get('starter_code_repository') or {}
                     if isinstance(repo_obj, dict):
                         repo_url = repo_obj.get('html_url') or repo_obj.get('url') or ''
                 if not repo_url:
                     repo_url = a.get('invitations_url') or ''
+                if not participant and repo_url and github_username:
+                    if github_username.lower() in repo_url.lower():
+                        participant = True
+                        matched_username = github_username
 
                 flat.append({
                     'name': a.get('title'),
@@ -221,6 +236,8 @@ class GitHubClient:
                     'assignment_id': a.get('id'),
                     'classroom_id': class_id,
                     'classroom_name': class_name,
+                     'participant': participant,
+                     'matched_username': matched_username,
                 })
         return flat
 
@@ -249,28 +266,67 @@ class GitHubClient:
             print(f"Exception getting assignment details: {e}")
             return None
 
-    def get_accepted_assignments(self, classroom_id: int, assignment_id: int) -> List[Dict]:
+    def get_accepted_assignments(self, assignment: Dict, classroom_id: Optional[int] = None) -> List[Dict]:
         """
         Get list of students who accepted an assignment.
 
         Args:
-            classroom_id: ID of the classroom
-            assignment_id: ID of the assignment
+            assignment: Assignment dictionary as returned by get_assignments_for_classroom
+            classroom_id: Optional classroom ID override
 
         Returns:
             List of accepted assignment dictionaries
         """
-        accepted = []
+        if not assignment:
+            return []
 
-        try:
-            url = f"{self.base_url}/classrooms/{classroom_id}/assignments/{assignment_id}/accepted_assignments"
-            response = requests.get(url, headers=self.headers)
+        def fetch_url(url: str) -> Optional[List[Dict]]:
+            items: List[Dict] = []
+            page = 1
+            while True:
+                params = {"per_page": 100, "page": page}
+                try:
+                    resp = requests.get(url, headers=self.headers, params=params)
+                except Exception as exc:
+                    print(f"Exception GET {url}: {exc}")
+                    return None
+                if resp.status_code == 404:
+                    return None
+                if resp.status_code != 200:
+                    print(f"Error GET {url}: {resp.status_code} - {resp.text}")
+                    return []
+                batch = resp.json()
+                if isinstance(batch, dict):
+                    # Endpoint returned dict, not list
+                    return []
+                if not batch:
+                    break
+                items.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+            return items
 
-            if response.status_code == 200:
-                accepted_data = response.json()
+        candidate_urls: List[str] = []
+        accepted_url = assignment.get('accepted_assignments_url')
+        if isinstance(accepted_url, str):
+            candidate_urls.append(accepted_url)
 
-                for acceptance in accepted_data:
-                    accepted.append({
+        assignment_id = assignment.get('id')
+        if assignment_id:
+            cid = classroom_id or (assignment.get('classroom') or {}).get('id')
+            if cid:
+                candidate_urls.append(f"{self.base_url}/classrooms/{cid}/assignments/{assignment_id}/accepted_assignments")
+            candidate_urls.append(f"{self.base_url}/assignments/{assignment_id}/accepted_assignments")
+
+        for url in candidate_urls:
+            result = fetch_url(url)
+            if result is None:
+                # Try next candidate
+                continue
+            if result:
+                return [
+                    {
                         'id': acceptance.get('id'),
                         'student': acceptance.get('student', {}),
                         'repository': acceptance.get('repository', {}),
@@ -281,14 +337,16 @@ class GitHubClient:
                         'passed': acceptance.get('passed', False),
                         'created_at': acceptance.get('created_at'),
                         'updated_at': acceptance.get('updated_at'),
-                    })
-            else:
-                print(f"Error getting accepted assignments: {response.status_code} - {response.text}")
+                        'github_username': acceptance.get('github_username'),
+                    }
+                    for acceptance in result
+                ]
+            if result == []:
+                # Valid endpoint but no data
+                return []
 
-        except Exception as e:
-            print(f"Exception getting accepted assignments: {e}")
-
-        return accepted
+        # Fallback: no endpoints accessible, return empty list
+        return []
 
     # Keep the existing methods for backward compatibility
     def get_user_repositories(self) -> List[Dict]:
