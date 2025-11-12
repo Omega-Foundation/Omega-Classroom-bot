@@ -13,7 +13,7 @@ class HomeworkTrackerBot:
     """Main bot class."""
     
     def __init__(self):
-        pass
+        self.teacher_password = Config.TEACHER_ACCESS_PASSWORD.strip() if Config.TEACHER_ACCESS_PASSWORD else ''
     
     def get_db(self):
         """Get database session."""
@@ -42,26 +42,47 @@ class HomeworkTrackerBot:
                 db.commit()
                 db.refresh(db_user)
             
+            role = (db_user.role or 'student').lower()
+            role_display = "Teacher" if role == 'teacher' else "Student"
+
             # Check if user has GitHub token
             if not db_user.github_token:
-                welcome_message = (
-                    f"👋 Welcome, {user.first_name}!\n\n"
-                    f"I'm your Omega Classroom tracking bot.\n\n"
-                    f"To get started, please provide your GitHub personal access token:\n"
-                    f"/register_token <your_github_token>\n\n"
-                    f"You can create a token at: https://github.com/settings/tokens\n"
-                    f"Required permissions: repo, read:org"
-                )
+                welcome_message = [
+                    f"👋 Welcome, {user.first_name}!",
+                    "",
+                    "I'm your Omega Classroom tracking bot.",
+                    "",
+                    "To get started, please provide your GitHub personal access token:",
+                    "/register_token <your_github_token>",
+                    "",
+                    "You can create a token at: https://github.com/settings/tokens",
+                    "Required permissions: repo, read:org",
+                ]
             else:
-                welcome_message = (
-                    f"Welcome back, {user.first_name}!\n\n"
-                    f"Available commands:\n"
-                    f"/assignments - List all your assignments\n"
-                    f"/add_assignment - Add a new assignment\n"
-                    f"/help - Show help\n"
-                )
+                welcome_message = [
+                    f"Welcome back, {user.first_name}! ({role_display})",
+                    "",
+                    "Available commands:",
+                    "/assignments - List your assignments",
+                    "/help - Show help",
+                ]
+                if role == 'teacher':
+                    welcome_message.extend([
+                        "/add_assignment - Add a new assignment",
+                        "/delete_assignment - Delete an assignment",
+                    ])
+            if not db_user.github_username:
+                welcome_message.extend([
+                    "",
+                    "I don't know your GitHub username yet.",
+                    "Please set it with: /set_github_username <github_login>",
+                ])
+            welcome_message.extend([
+                "",
+                "Need to switch roles? Use /set_role <student|teacher> [password]",
+            ])
             
-            await update.message.reply_text(welcome_message)
+            await update.message.reply_text('\n'.join(welcome_message))
         finally:
             db.close()
     
@@ -72,12 +93,15 @@ class HomeworkTrackerBot:
             "/start - Start the bot\n"
             "/register_token <token> - Register your GitHub personal access token\n"
             "/assignments - List all your assignments\n"
-            "/add_assignment - Add a new assignment to track\n"
             "/add_ci_repo <repo> - Track GitHub Actions status for a repository\n"
             "/remove_ci_repo <repo> - Stop tracking repository CI status\n"
             "/ci_status - Show latest CI status for tracked repositories\n"
             "/set_my_notify_threshold <days> - Start notifications N days before deadline (you)\n"
             "/set_my_notify_period <value><m|h> - Reminder interval for you (e.g. 60m, 1h)\n"
+            "/set_role <student|teacher> [password] - Switch between student and teacher roles\n"
+            "/set_github_username <username> - Manually set your GitHub username\n"
+            "\nTeacher-only commands:\n"
+            "/add_assignment - Add a new assignment\n"
             "/delete_assignment - Delete an assignment\n"
             "/help - Show this help message\n"
         )
@@ -118,16 +142,28 @@ class HomeworkTrackerBot:
             db_user = db.query(User).filter(User.telegram_id == chat_id).first()
             if db_user:
                 db_user.github_token = github_token
-                db_user.github_username = github_username
+                if github_username:
+                    db_user.github_username = github_username
                 db.commit()
-                await update.message.reply_text(
-                    f"✅ GitHub token registered successfully!\n\n"
-                    f"GitHub username: {github_username}\n"
-                    f"Your token has been saved securely.\n\n"
-                    f"Now you can:\n"
-                    f"/assignments - View your assignments\n"
-                    f"/add_assignment - Add a new assignment"
-                )
+                display_username = github_username or db_user.github_username
+                message_lines = [
+                    "✅ GitHub token registered successfully!",
+                    "",
+                    f"GitHub username: {display_username or 'Not detected'}",
+                    "Your token has been saved securely.",
+                    "",
+                    "Next steps:",
+                    "/assignments - View your assignments",
+                ]
+                if (db_user.role or 'student').lower() == 'teacher':
+                    message_lines.append("/add_assignment - Add a new assignment")
+                if not github_username:
+                    message_lines.extend([
+                        "",
+                        "I could not determine your GitHub username.",
+                        "Please set it manually: /set_github_username <github_login>"
+                    ])
+                await update.message.reply_text('\n'.join(message_lines))
             else:
                 await update.message.reply_text(
                     "Please use /start first to register."
@@ -151,6 +187,13 @@ class HomeworkTrackerBot:
                 await update.message.reply_text(
                     "Please register your GitHub token first:\n"
                     "/register_token <your_github_token>"
+                )
+                return
+
+            if not db_user.github_username:
+                await update.message.reply_text(
+                    "Please set your GitHub username so I can look up your assignments:\n"
+                    "/set_github_username <github_login>"
                 )
                 return
 
@@ -301,6 +344,12 @@ class HomeworkTrackerBot:
                 await update.message.reply_text(
                     "Please register your GitHub token first:\n"
                     "/register_token <your_github_token>"
+                )
+                return
+
+            if (db_user.role or 'student').lower() != 'teacher':
+                await update.message.reply_text(
+                    "Only teachers can add assignments. Use /set_role teacher <password> if you have teacher access."
                 )
                 return
             
@@ -591,6 +640,12 @@ class HomeworkTrackerBot:
                 await update.message.reply_text("Please use /start first.")
                 return
             
+            if (db_user.role or 'student').lower() != 'teacher':
+                await update.message.reply_text(
+                    "Only teachers can delete assignments. Use /set_role teacher <password> if you have teacher access."
+                )
+                return
+            
             if not context.args:
                 await update.message.reply_text(
                     "Usage: /delete_assignment <assignment_name>\n\n"
@@ -693,6 +748,81 @@ class HomeworkTrackerBot:
         finally:
             db.close()
 
+    async def set_role(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /set_role <student|teacher> [password]."""
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            if not context.args:
+                await update.message.reply_text(
+                    "Usage: /set_role <student|teacher> [password]\n"
+                    "Teachers must supply the shared access password."
+                )
+                return
+
+            desired_role = context.args[0].strip().lower()
+            if desired_role not in ('student', 'teacher'):
+                await update.message.reply_text("Role must be either 'student' or 'teacher'.")
+                return
+
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+
+            if desired_role == 'teacher':
+                if not self.teacher_password:
+                    await update.message.reply_text(
+                        "Teacher role is not configured by the administrator."
+                    )
+                    return
+                if len(context.args) < 2:
+                    await update.message.reply_text("Teacher role requires a password.")
+                    return
+                provided_password = context.args[1]
+                if provided_password != self.teacher_password:
+                    await update.message.reply_text("Invalid teacher password.")
+                    return
+
+            db_user.role = desired_role
+            db.commit()
+            await update.message.reply_text(
+                f"✅ Your role has been updated to '{desired_role.title()}'."
+            )
+        finally:
+            db.close()
+
+    async def set_github_username(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /set_github_username <username>."""
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            if not context.args:
+                await update.message.reply_text(
+                    "Usage: /set_github_username <username>"
+                )
+                return
+
+            github_username = context.args[0].strip()
+            if not re.match(r"^[A-Za-z0-9-]{1,39}$", github_username):
+                await update.message.reply_text(
+                    "Invalid GitHub username. It should be 1-39 characters, containing letters, numbers, or hyphens."
+                )
+                return
+
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+
+            db_user.github_username = github_username
+            db.commit()
+            await update.message.reply_text(
+                f"✅ GitHub username set to {github_username}."
+            )
+        finally:
+            db.close()
+
 def main():
     """Main function to run the bot."""
     # Validate configuration
@@ -723,6 +853,8 @@ def main():
     application.add_handler(CommandHandler("delete_assignment", bot_instance.delete_assignment))
     application.add_handler(CommandHandler("set_my_notify_threshold", bot_instance.set_my_notify_threshold))
     application.add_handler(CommandHandler("set_my_notify_period", bot_instance.set_my_notify_period))
+    application.add_handler(CommandHandler("set_role", bot_instance.set_role))
+    application.add_handler(CommandHandler("set_github_username", bot_instance.set_github_username))
     
     # Start the bot
     print("Bot is starting...")

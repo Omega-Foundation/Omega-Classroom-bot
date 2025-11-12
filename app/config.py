@@ -9,6 +9,7 @@ class Config:
     
     # Telegram Bot
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+    TEACHER_ACCESS_PASSWORD = os.getenv('TEACHER_ACCESS_PASSWORD', '')
     
     # GitHub
     GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
@@ -49,6 +50,7 @@ class Config:
         """Validate that all required configuration is present."""
         required = [
             ('TELEGRAM_BOT_TOKEN', cls.TELEGRAM_BOT_TOKEN),
+            ('TEACHER_ACCESS_PASSWORD', cls.TEACHER_ACCESS_PASSWORD),
         ]
         
         missing = [name for name, value in required if not value]

@@ -16,6 +16,7 @@ A Telegram bot for tracking assignments in GitHub Classroom. It automatically mo
 - Docker and Docker Compose (for Docker deployment)
 - OR Python 3.8 or higher (for local development)
 - Telegram Bot Token (from [@BotFather](https://t.me/botfather))
+- Teacher access password (shared secret for granting teacher role)
 - GitHub Personal Access Token with appropriate permissions
 
 ## Deployment with Docker (Recommended)
@@ -31,6 +32,7 @@ A Telegram bot for tracking assignments in GitHub Classroom. It automatically mo
    
    Edit `.env` and fill in:
    - `TELEGRAM_BOT_TOKEN`: Your Telegram bot token
+   - `TEACHER_ACCESS_PASSWORD`: Shared secret teachers must enter
    - `GITHUB_TOKEN`: Your GitHub personal access token
    - Database settings (PostgreSQL will be used automatically in Docker)
 
@@ -94,6 +96,7 @@ docker compose exec db psql -U postgres -d omega_classroom  # Access database
    
    Edit `.env` and fill in:
    - `TELEGRAM_BOT_TOKEN`: Your Telegram bot token
+   - `TEACHER_ACCESS_PASSWORD`: Shared secret teachers must enter
    - `GITHUB_TOKEN`: Your GitHub personal access token
    - `DATABASE_URL`: Use SQLite for local development: `sqlite:///omega_classroom.db`
    - `NOTIFICATION_CHECK_INTERVAL`: How often to check for notifications (in seconds)
@@ -117,24 +120,30 @@ docker compose exec db psql -U postgres -d omega_classroom  # Access database
 2. **Register your GitHub token**: `/register_token <your_github_token>`
    - Create a token at: https://github.com/settings/tokens
    - Required permissions: `repo`, `read:org`
-   - The bot will automatically detect your GitHub username from the token
+   - The bot will automatically detect your GitHub username from the token when possible. Otherwise, set it manually with `/set_github_username <username>`.
 
-3. **View your assignments**: `/assignments`
+3. **Set your GitHub username (if needed)**: `/set_github_username <username>`
+   - Required if the bot could not detect your username from the token
+
+4. **Choose your role**: `/set_role <student|teacher> [password]`
+   - Teachers must supply the shared password defined in `TEACHER_ACCESS_PASSWORD`
+
+5. **View your assignments**: `/assignments`
    - Lists all assignments you've added
    - Shows deadline and time remaining
 
-4. **Add an assignment**: `/add_assignment <name> <repo_link> <deadline>`
+6. **Teacher-only** – Add an assignment: `/add_assignment <name> <repo_link> <deadline>`
    - Example: `/add_assignment "Homework 1" https://github.com/org/repo "Nov 11, 2025, 22:33 UTC"`
    - Or with repo path: `/add_assignment "Project" org/repo-name "Dec 31, 2024, 23:59 UTC"`
    - The bot will validate the repository exists and is accessible with your token
    - The bot will automatically monitor the deadline and notify you
 
-5. **Delete an assignment**: `/delete_assignment <assignment_name>`
+7. **Teacher-only** – Delete an assignment: `/delete_assignment <assignment_name>`
    - Example: `/delete_assignment "Homework 1"`
    - Deletes the assignment and stops monitoring it
    - Use `/assignments` to see your assignments
 
-6. **Get help**: `/help`
+8. **Get help**: `/help`
    - Shows all available commands
 
 ## Database Schema

@@ -19,6 +19,7 @@ class User(Base):
     last_name = Column(String(255))
     github_username = Column(String(255))
     github_token = Column(String(500))  # Store GitHub personal access token
+    role = Column(String(20), nullable=False, default='student')  # 'student' or 'teacher'
     # Per-user notification settings (override app defaults if set)
     notify_threshold_hours = Column(Integer)  # if None, fallback to app settings
     notify_period_seconds = Column(Integer)   # if None, fallback to app settings
@@ -101,6 +102,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     try:
         _migrate_user_notification_columns()
+        _migrate_user_role_column()
     except Exception as e:
         # Non-fatal: log and continue
         print(f"Migration check failed: {e}")
@@ -157,3 +159,19 @@ def _migrate_user_notification_columns():
             except Exception:
                 pass
 
+def _migrate_user_role_column():
+    """Ensure the user role column exists."""
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        if dialect == 'postgresql':
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'student' NOT NULL"))
+        elif dialect == 'sqlite':
+            res = conn.execute(text("PRAGMA table_info('users')"))
+            cols = {row[1] for row in res.fetchall()}
+            if 'role' not in cols:
+                conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'student' NOT NULL"))
+        else:
+            try:
+                conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'student' NOT NULL"))
+            except Exception:
+                pass
