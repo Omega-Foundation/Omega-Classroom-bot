@@ -41,6 +41,7 @@ class Assignment(Base):
     classroom_id = Column(String(255))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    note = Column(Text, default='')
     
     # Relationships
     user_id = Column(Integer, ForeignKey('users.id'))
@@ -87,6 +88,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     try:
         _migrate_user_notification_columns()
+        _migrate_assignment_status_column()
     except Exception as e:
         # Non-fatal: log and continue
         print(f"Migration check failed: {e}")
@@ -143,3 +145,19 @@ def _migrate_user_notification_columns():
             except Exception:
                 pass
 
+def _migrate_assignment_status_column():
+    """Ensure new assignment note column exists (best-effort, idempotent)."""
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        if dialect == 'postgresql':
+            conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS note TEXT"))
+        elif dialect == 'sqlite':
+            res = conn.execute(text("PRAGMA table_info('assignments')"))
+            cols = {row[1] for row in res.fetchall()}
+            if 'note' not in cols:
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN note TEXT"))
+        else:
+            try:
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN note TEXT"))
+            except Exception:
+                pass

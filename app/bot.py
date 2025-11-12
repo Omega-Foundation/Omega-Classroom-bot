@@ -58,6 +58,9 @@ class HomeworkTrackerBot:
                     f"Available commands:\n"
                     f"/assignments - List all your assignments\n"
                     f"/add_assignment - Add a new assignment\n"
+                    f"/delete_assignment - Delete an assignment\n"
+                    f"/add_note - Add a note to an assignment\n"
+                    f"/delete_note - Delete a note from an assignment\n"
                     f"/help - Show help\n"
                 )
             
@@ -76,6 +79,8 @@ class HomeworkTrackerBot:
             "/set_my_notify_threshold <days> - Start notifications N days before deadline (you)\n"
             "/set_my_notify_period <value><m|h> - Reminder interval for you (e.g. 60m, 1h)\n"
             "/delete_assignment - Delete an assignment\n"
+            "/add_note <assignment_name> <text> - Add a note to an assignment\n"
+            "/delete_note <assignment_name> - Delete a note from an assignment\n"
             "/help - Show this help message\n"
         )
         await update.message.reply_text(help_text)
@@ -154,7 +159,7 @@ class HomeworkTrackerBot:
             # Build a unified map keyed by normalized name to dedupe
             entries_map = {}
 
-            def add_or_merge(name: str, deadline: datetime, url: str):
+            def add_or_merge(name: str, deadline: datetime, url: str, note: str = ''):
                 if not name:
                     return
                 key = name.strip().lower()
@@ -163,7 +168,8 @@ class HomeworkTrackerBot:
                     entries_map[key] = {
                         'name': name.strip().strip('"'),
                         'deadline': deadline,
-                        'url': url or ''
+                        'url': url or '',
+                        'note': note
                     }
                 else:
                     # Prefer existing deadline if present; otherwise take new
@@ -181,7 +187,7 @@ class HomeworkTrackerBot:
             ).order_by(Assignment.deadline).all()
             for a in saved_assignments:
                 saved_url = a.github_repo_url or a.github_repo_name or ''
-                add_or_merge(a.name, a.deadline, saved_url)
+                add_or_merge(a.name, a.deadline, saved_url, a.note)
 
             # Classroom assignments (also auto-save if missing)
             try:
@@ -278,6 +284,8 @@ class HomeworkTrackerBot:
                         out += f"Deadline: N/A\n\n"
                     repo_out = e.get('url') or 'N/A'
                     out += f"Repository: {repo_out}\n\n"
+                    if e.get('note'):
+                        out += f"Note: {e['note']}\n\n"
                 await update.message.reply_text(out)
         finally:
             db.close()
@@ -497,6 +505,82 @@ class HomeworkTrackerBot:
         finally:
             db.close()
 
+    async def add_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            if not context.args or len(context.args) < 2:
+                await update.message.reply_text(
+                    "Usage: /add_note <assignment_name> <text>\n"
+                    "Examples: /add_note my-homework CI is broken, fixing in 2 hours"
+                )
+                return 
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+
+            assignment_name = context.args[0]
+            note = ' '.join(context.args[1:])
+
+            # Find assignment by name (case-insensitive) that belongs to this user
+            assignment = db.query(Assignment).filter(
+                and_(
+                    Assignment.user_id == db_user.id,
+                    Assignment.name.ilike(f"%{assignment_name}%")
+                )
+            ).first()
+            if not assignment:
+                await update.message.reply_text(
+                    f"❌ Assignment '{assignment_name}' not found.\n\n"
+                    f"Use /assignments to see your assignments."
+                )
+                return
+            assignment.note = note
+            db.commit()
+            await update.message.reply_text(
+                f"✅ Note \"{note}\" for assignment '{assignment_name}' added successfully!"
+            )
+        finally:
+            db.close()
+
+    async def delete_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            if not context.args:
+                await update.message.reply_text(
+                    "Usage: /delete_note <assignment_name>\n"
+                    "Examples: /delete_note my-homework"
+                )
+                return
+
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+
+            assignment_name = context.args[0]
+            assignment = db.query(Assignment).filter(
+                and_(
+                    Assignment.user_id == db_user.id,
+                    Assignment.name.ilike(f"%{assignment_name}%")
+                )
+            ).first()
+            if not assignment:
+                await update.message.reply_text(
+                    f"❌ Assignment '{assignment_name}' not found.\n\n"
+                    f"Use /assignments to see your assignments."
+                )
+                return
+            assignment.note = ''
+            db.commit()
+            await update.message.reply_text(
+                f"✅ Note for assignment '{assignment_name}' deleted successfully!"
+            )
+        finally:
+            db.close()
+
 def main():
     """Main function to run the bot."""
     # Validate configuration
@@ -524,6 +608,8 @@ def main():
     application.add_handler(CommandHandler("delete_assignment", bot_instance.delete_assignment))
     application.add_handler(CommandHandler("set_my_notify_threshold", bot_instance.set_my_notify_threshold))
     application.add_handler(CommandHandler("set_my_notify_period", bot_instance.set_my_notify_period))
+    application.add_handler(CommandHandler("add_note", bot_instance.add_note))
+    application.add_handler(CommandHandler("delete_note", bot_instance.delete_note))
     
     # Start the bot
     print("Bot is starting...")
