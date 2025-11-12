@@ -2,7 +2,7 @@
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from sqlalchemy import and_
-from app.database import User, Assignment, get_db, init_db
+from app.database import User, Assignment, TrackedRepository, get_db, init_db
 from app.github_client import GitHubClient
 from datetime import datetime, timezone
 from app.config import Config
@@ -73,6 +73,9 @@ class HomeworkTrackerBot:
             "/register_token <token> - Register your GitHub personal access token\n"
             "/assignments - List all your assignments\n"
             "/add_assignment - Add a new assignment to track\n"
+            "/add_ci_repo <repo> - Track GitHub Actions status for a repository\n"
+            "/remove_ci_repo <repo> - Stop tracking repository CI status\n"
+            "/ci_status - Show latest CI status for tracked repositories\n"
             "/set_my_notify_threshold <days> - Start notifications N days before deadline (you)\n"
             "/set_my_notify_period <value><m|h> - Reminder interval for you (e.g. 60m, 1h)\n"
             "/delete_assignment - Delete an assignment\n"
@@ -383,6 +386,199 @@ class HomeworkTrackerBot:
         finally:
             db.close()
     
+    async def add_ci_repo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /add_ci_repo command to start tracking CI status."""
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+            if not db_user.github_token:
+                await update.message.reply_text(
+                    "Please register your GitHub token first:\n"
+                    "/register_token <your_github_token>"
+                )
+                return
+            if not context.args:
+                await update.message.reply_text(
+                    "Usage: /add_ci_repo <repo_url_or_owner/repo>\n\n"
+                    "Example: /add_ci_repo https://github.com/org/project"
+                )
+                return
+
+            raw_repo = ' '.join(context.args).strip('"\'')
+            try:
+                github_client = GitHubClient(token=db_user.github_token)
+                repo_full_name = github_client.parse_repo_url(raw_repo)
+                if not repo_full_name:
+                    await update.message.reply_text(
+                        f"❌ Не удалось распознать репозиторий: {raw_repo}\n"
+                        f"Используйте формат https://github.com/owner/repo или owner/repo."
+                    )
+                    return
+
+                repo_full_name = repo_full_name.strip().strip('/').lower()
+
+                if not github_client.check_repository_exists(repo_full_name):
+                    await update.message.reply_text(
+                        f"❌ Репозиторий '{repo_full_name}' не найден или недоступен."
+                    )
+                    return
+            except Exception as e:
+                await update.message.reply_text(f"❌ Ошибка доступа к GitHub: {str(e)}")
+                return
+
+            existing = db.query(TrackedRepository).filter(
+                TrackedRepository.user_id == db_user.id,
+                TrackedRepository.repo_full_name == repo_full_name
+            ).first()
+            if existing:
+                await update.message.reply_text(
+                    f"ℹ️ Репозиторий '{repo_full_name}' уже отслеживается."
+                )
+                return
+
+            repo_url = f"https://github.com/{repo_full_name}"
+            tracked = TrackedRepository(
+                user_id=db_user.id,
+                repo_full_name=repo_full_name,
+                repo_url=repo_url
+            )
+            db.add(tracked)
+            db.commit()
+
+            await update.message.reply_text(
+                f"✅ Репозиторий '{repo_full_name}' добавлен для отслеживания CI."
+            )
+        finally:
+            db.close()
+
+    async def remove_ci_repo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /remove_ci_repo command to stop tracking CI status."""
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+            if not context.args:
+                await update.message.reply_text(
+                    "Usage: /remove_ci_repo <owner/repo>"
+                )
+                return
+
+            raw_repo = ' '.join(context.args).strip('"\'')
+            github_client = GitHubClient(token=db_user.github_token) if db_user.github_token else None
+            repo_full_name = None
+            if github_client:
+                repo_full_name = github_client.parse_repo_url(raw_repo)
+                if repo_full_name:
+                    repo_full_name = repo_full_name.strip().strip('/').lower()
+            if not repo_full_name:
+                repo_full_name = raw_repo.strip().strip('/') if '/' in raw_repo else None
+                if repo_full_name:
+                    repo_full_name = repo_full_name.lower()
+            if not repo_full_name:
+                await update.message.reply_text(
+                    f"❌ Не удалось распознать репозиторий: {raw_repo}"
+                )
+                return
+
+            tracked = db.query(TrackedRepository).filter(
+                TrackedRepository.user_id == db_user.id,
+                TrackedRepository.repo_full_name == repo_full_name
+            ).first()
+            if not tracked:
+                await update.message.reply_text(
+                    f"ℹ️ Репозиторий '{repo_full_name}' не найден в списке отслеживания."
+                )
+                return
+
+            db.delete(tracked)
+            db.commit()
+            await update.message.reply_text(
+                f"✅ Репозиторий '{tracked.repo_full_name}' удалён из отслеживания."
+            )
+        finally:
+            db.close()
+
+    async def ci_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /ci_status command to show latest CI results."""
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+            if not db_user.github_token:
+                await update.message.reply_text(
+                    "Please register your GitHub token first:\n"
+                    "/register_token <your_github_token>"
+                )
+                return
+
+            github_client = GitHubClient(token=db_user.github_token)
+
+            repo_filter = None
+            if context.args:
+                filter_raw = ' '.join(context.args).strip('"\'')
+                repo_filter = github_client.parse_repo_url(filter_raw)
+                if not repo_filter:
+                    await update.message.reply_text(
+                        f"❌ Не удалось распознать репозиторий: {filter_raw}\n"
+                        f"Используйте формат owner/repo."
+                    )
+                    return
+                repo_filter = repo_filter.strip().strip('/').lower()
+
+            query = db.query(TrackedRepository).filter(
+                TrackedRepository.user_id == db_user.id
+            )
+            if repo_filter:
+                query = query.filter(TrackedRepository.repo_full_name == repo_filter)
+
+            tracked_repos = query.order_by(TrackedRepository.repo_full_name).all()
+            if not tracked_repos:
+                await update.message.reply_text(
+                    "Список отслеживаемых репозиториев пуст.\n"
+                    "Добавьте его командой /add_ci_repo <owner/repo>."
+                )
+                return
+
+            responses = []
+            for repo in tracked_repos:
+                try:
+                    status = github_client.get_ci_status(repo.repo_full_name)
+                except Exception as e:
+                    responses.append(
+                        f"• {repo.repo_full_name}\n"
+                        f"Не удалось получить статус CI: {str(e)}"
+                    )
+                    continue
+
+                part = [f"• {repo.repo_full_name}"]
+                part.append(status.get("message", ""))
+                if status.get("html_url"):
+                    part.append(f"Ссылка на запуск: {status['html_url']}")
+                failure_summary = status.get("failure_summary")
+                if failure_summary:
+                    max_len = 1200
+                    summary = failure_summary.strip()
+                    if len(summary) > max_len:
+                        summary = summary[:max_len] + "…"
+                    part.append("Последние ошибки:")
+                    part.append(summary)
+
+                responses.append('\n'.join(filter(None, part)))
+
+            await update.message.reply_text('\n\n'.join(responses))
+        finally:
+            db.close()
+    
     async def delete_assignment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /delete_assignment command - delete an assignment by name."""
         chat_id = update.effective_chat.id
@@ -521,6 +717,9 @@ def main():
     application.add_handler(CommandHandler("register_token", bot_instance.register_token))
     application.add_handler(CommandHandler("assignments", bot_instance.list_assignments))
     application.add_handler(CommandHandler("add_assignment", bot_instance.add_assignment))
+    application.add_handler(CommandHandler("add_ci_repo", bot_instance.add_ci_repo))
+    application.add_handler(CommandHandler("remove_ci_repo", bot_instance.remove_ci_repo))
+    application.add_handler(CommandHandler("ci_status", bot_instance.ci_status))
     application.add_handler(CommandHandler("delete_assignment", bot_instance.delete_assignment))
     application.add_handler(CommandHandler("set_my_notify_threshold", bot_instance.set_my_notify_threshold))
     application.add_handler(CommandHandler("set_my_notify_period", bot_instance.set_my_notify_period))

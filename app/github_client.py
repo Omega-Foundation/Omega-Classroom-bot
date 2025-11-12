@@ -444,6 +444,134 @@ class GitHubClient:
             'url': repo.html_url,
         }
 
+    def get_latest_workflow_run(self, repo_full_name: str) -> Optional[Dict[str, Any]]:
+        """Fetch the latest workflow run for a repository."""
+        url = f"{self.base_url}/repos/{repo_full_name}/actions/runs"
+        try:
+            resp = requests.get(url, headers=self.headers, params={"per_page": 1})
+        except Exception as e:
+            print(f"Error requesting workflow runs for {repo_full_name}: {e}")
+            return None
+
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            print(f"Unexpected status when fetching workflow runs for {repo_full_name}: {resp.status_code} - {resp.text}")
+            return None
+
+        data = resp.json() or {}
+        runs = data.get("workflow_runs") or []
+        if not runs:
+            return None
+
+        run = runs[0]
+        run_id = run.get("id")
+        failure_summary = None
+        if run.get("conclusion") == "failure" and run_id:
+            failure_summary = self._get_run_failure_summary(repo_full_name, run_id)
+
+        return {
+            "id": run_id,
+            "name": run.get("name") or run.get("display_title"),
+            "status": run.get("status"),
+            "conclusion": run.get("conclusion"),
+            "event": run.get("event"),
+            "updated_at": run.get("updated_at"),
+            "run_number": run.get("run_number"),
+            "html_url": run.get("html_url"),
+            "failure_summary": failure_summary,
+        }
+
+    def _get_run_failure_summary(self, repo_full_name: str, run_id: int) -> Optional[str]:
+        """Collect failure details for a workflow run."""
+        url = f"{self.base_url}/repos/{repo_full_name}/actions/runs/{run_id}/jobs"
+        try:
+            resp = requests.get(url, headers=self.headers, params={"per_page": 100})
+        except Exception as e:
+            print(f"Error requesting workflow jobs for {repo_full_name}#{run_id}: {e}")
+            return None
+
+        if resp.status_code != 200:
+            print(f"Unexpected status when fetching jobs for {repo_full_name}#{run_id}: {resp.status_code} - {resp.text}")
+            return None
+
+        data = resp.json() or {}
+        jobs = data.get("jobs") or []
+        messages: List[str] = []
+
+        for job in jobs:
+            if job.get("conclusion") != "failure":
+                continue
+            job_name = job.get("name") or "Unnamed job"
+            job_url = job.get("html_url")
+            prefix = f"Job '{job_name}' failed"
+            if job_url:
+                prefix += f" ({job_url})"
+            failure_message = job.get("failure_message")
+            if failure_message:
+                messages.append(f"{prefix}: {failure_message}")
+            else:
+                messages.append(prefix)
+
+            for step in job.get("steps") or []:
+                if step.get("conclusion") == "failure":
+                    step_name = step.get("name") or "Unnamed step"
+                    details = (step.get("failure_message") or "").strip()
+                    if details:
+                        messages.append(f"  Step '{step_name}': {details}")
+                    else:
+                        messages.append(f"  Step '{step_name}' failed.")
+
+        if not messages:
+            return None
+        return "\n".join(messages)
+
+    def get_ci_status(self, repo_full_name: str) -> Dict[str, Any]:
+        """
+        Return GitHub Actions CI status for repository.
+
+        Returns dict with keys:
+            - found (bool)
+            - status (str) raw run status
+            - conclusion (str or None)
+            - message (str) localized message for bot
+            - html_url (str or None)
+            - failure_summary (str or None)
+        """
+        run = self.get_latest_workflow_run(repo_full_name)
+        if not run:
+            return {
+                "found": False,
+                "status": None,
+                "conclusion": None,
+                "message": "Нет запусков GitHub Actions для репозитория.",
+                "html_url": None,
+                "failure_summary": None,
+            }
+
+        status = run.get("status") or ""
+        conclusion = run.get("conclusion")
+        html_url = run.get("html_url")
+        failure_summary = run.get("failure_summary")
+
+        if conclusion == "success":
+            message = "Сборка удалась ✅"
+        elif conclusion == "failure":
+            message = "Сборка завершилась с ошибками ❌"
+        elif status in {"queued", "in_progress", "waiting"}:
+            message = "Сборка выполняется… ⏳"
+        else:
+            message = f"Состояние сборки: {conclusion or status or 'неизвестно'}"
+
+        return {
+            "found": True,
+            "status": status,
+            "conclusion": conclusion,
+            "message": message,
+            "html_url": html_url,
+            "failure_summary": failure_summary,
+        }
+
 
 # Example usage
 if __name__ == "__main__":

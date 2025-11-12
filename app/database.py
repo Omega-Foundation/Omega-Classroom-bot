@@ -1,6 +1,6 @@
 """Database models and connection handling."""
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Text
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Text, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy import text
@@ -27,6 +27,7 @@ class User(Base):
     # Relationships
     assignments = relationship('Assignment', back_populates='user')
     submissions = relationship('Submission', back_populates='user')
+    ci_repositories = relationship('TrackedRepository', back_populates='user', cascade='all, delete-orphan')
 
 class Assignment(Base):
     """Assignment model."""
@@ -65,6 +66,19 @@ class Submission(Base):
     # Relationships
     assignment = relationship('Assignment', back_populates='submissions')
     user = relationship('User', back_populates='submissions')
+
+class TrackedRepository(Base):
+    """Repository subscriptions for CI status tracking."""
+    __tablename__ = 'tracked_repositories'
+    __table_args__ = (UniqueConstraint('user_id', 'repo_full_name', name='uq_user_repo'),)
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    repo_full_name = Column(String(255), nullable=False)
+    repo_url = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship('User', back_populates='ci_repositories')
 
 class Notification(Base):
     """Notification tracking model."""
