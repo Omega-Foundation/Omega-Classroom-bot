@@ -384,6 +384,8 @@ class HomeworkTrackerBot:
                     welcome_message.extend([
                         "/add_assignment - Add a new assignment",
                         "/delete_assignment - Delete an assignment",
+                        "/add_note - Add a note to an assignment",
+                        "/delete_note - Delete a note from an assignment",
                         "/classroom_assignments - Classroom overview",
                         "/export_assignments_excel - Export classroom data",
                         "/dump_submissions - Dump submissions table",
@@ -422,6 +424,8 @@ class HomeworkTrackerBot:
             "\nTeacher-only commands:\n"
             "/add_assignment - Add a new assignment\n"
             "/delete_assignment - Delete an assignment\n"
+        "/add_note <assignment_name> <text> - Add a note to an assignment\n"
+        "/delete_note <assignment_name> - Delete a note from an assignment\n"
             "/classroom_assignments - View classroom assignments overview\n"
             "/export_assignments_excel - Export classroom data to Excel\n"
             "/dump_submissions - Dump submissions table\n"
@@ -529,9 +533,13 @@ class HomeworkTrackerBot:
             username_lower = db_user.github_username.lower()
 
             def add_entry(data: Dict):
-                entries.append(data)
+                entry = dict(data)
+                entry.setdefault('note', '')
+                entries.append(entry)
 
             seen_keys = set()
+            assignment_note_lookup: Dict[str, str] = {}
+            assignment_title_lookup: Dict[str, str] = {}
 
             if assignments:
                 now = datetime.utcnow()
@@ -565,8 +573,11 @@ class HomeworkTrackerBot:
                             if isinstance(submitted_at, datetime):
                                 submitted_at_str = submitted_at.strftime('%Y-%m-%d %H:%M:%S UTC')
 
-                    key = (assignment.classroom_assignment_id or assignment.id or assignment.name, teacher_name)
+                    key_identifier = assignment.classroom_assignment_id or assignment.id or assignment.name or ''
+                    key = (str(key_identifier), teacher_name)
                     seen_keys.add(key)
+
+                    note_value = (assignment.note or '').strip()
 
                     add_entry({
                         'name': assignment.name,
@@ -578,7 +589,15 @@ class HomeworkTrackerBot:
                         'submission_status': submission_status,
                         'submitted_at': submitted_at_str,
                         'source': 'Submission',
+                        'note': note_value,
                     })
+
+                    if assignment.classroom_assignment_id:
+                        assignment_note_lookup[str(assignment.classroom_assignment_id)] = note_value
+                    if assignment.id is not None:
+                        assignment_note_lookup[str(assignment.id)] = note_value
+                    if assignment.name:
+                        assignment_title_lookup[assignment.name.lower()] = note_value
 
             classroom_records = (
                 db.query(ClassroomAssignmentRecord)
@@ -598,7 +617,8 @@ class HomeworkTrackerBot:
                 teacher_name = ""
                 if teacher:
                     teacher_name = teacher.first_name or teacher.username or teacher.github_username or ""
-                key = (record.assignment_id or record.assignment_title, teacher_name)
+                record_identifier = record.assignment_id or record.assignment_title or ''
+                key = (str(record_identifier), teacher_name)
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
@@ -619,6 +639,33 @@ class HomeworkTrackerBot:
                 if record.submitted is not None:
                     submission_status = "Submitted" if record.submitted else "In progress"
 
+                note_value = ''
+                if record.assignment_id:
+                    note_value = assignment_note_lookup.get(str(record.assignment_id), '')
+                if not note_value and record.assignment_title:
+                    note_value = assignment_title_lookup.get(record.assignment_title.lower(), '')
+                if not note_value and record.assignment_id:
+                    assignment_id_str = str(record.assignment_id)
+                    linked_assignment = (
+                        db.query(Assignment)
+                        .filter(Assignment.classroom_assignment_id == assignment_id_str)
+                        .first()
+                    )
+                    if not linked_assignment and assignment_id_str.isdigit():
+                        linked_assignment = (
+                            db.query(Assignment)
+                            .filter(Assignment.id == int(assignment_id_str))
+                            .first()
+                        )
+                    if linked_assignment:
+                        note_value = (linked_assignment.note or '').strip()
+                        if linked_assignment.classroom_assignment_id:
+                            assignment_note_lookup[str(linked_assignment.classroom_assignment_id)] = note_value
+                        if linked_assignment.id is not None:
+                            assignment_note_lookup[str(linked_assignment.id)] = note_value
+                        if linked_assignment.name:
+                            assignment_title_lookup[linked_assignment.name.lower()] = note_value
+
                 add_entry({
                     'name': record.assignment_title or 'Classroom Assignment',
                     'deadline': deadline,
@@ -629,6 +676,7 @@ class HomeworkTrackerBot:
                     'submission_status': submission_status,
                     'submitted_at': None,
                     'source': 'Classroom Snapshot',
+                    'note': note_value,
                 })
 
             if not entries:
@@ -653,6 +701,10 @@ class HomeworkTrackerBot:
                     if entry['submitted_at']:
                         lines.append(f"Submitted at: {entry['submitted_at']}")
                     lines.append(f"Source: {entry['source']}")
+                    note_value = (entry.get('note') or '').strip()
+                    if note_value:
+                        lines.append("")
+                        lines.append(f"Note: {note_value}")
                     lines.append("")
 
                 await update.message.reply_text("\n".join(lines).strip())
@@ -1766,6 +1818,100 @@ class HomeworkTrackerBot:
         finally:
             db.close()
 
+    async def add_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /add_note <assignment_name> <text> to annotate an assignment."""
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            if not context.args or len(context.args) < 2:
+                await update.message.reply_text(
+                    "Usage: /add_note <assignment_name> <text>\n"
+                    "Example: /add_note data-test-2 Students CI has out of memory error"
+                )
+                return
+
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+
+            if (db_user.role or 'student').lower() != 'teacher':
+                await update.message.reply_text(
+                    "Only teachers can add notes. Use /set_role teacher <password> if you have teacher access."
+                )
+                return
+
+            assignment_name = context.args[0]
+            note_text = ' '.join(context.args[1:]).strip()
+            if not note_text:
+                await update.message.reply_text("Note text cannot be empty.")
+                return
+
+            assignment = db.query(Assignment).filter(
+                and_(
+                    Assignment.user_id == db_user.id,
+                    Assignment.name.ilike(f"%{assignment_name}%")
+                )
+            ).first()
+            if not assignment:
+                await update.message.reply_text(
+                    f"❌ Assignment '{assignment_name}' not found.\n\n"
+                    "Use /assignments to see your assignments."
+                )
+                return
+
+            assignment.note = note_text
+            db.commit()
+            await update.message.reply_text(
+                f"✅ Note for assignment '{assignment.name}' added successfully!"
+            )
+        finally:
+            db.close()
+
+    async def delete_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /delete_note <assignment_name> to remove a note."""
+        chat_id = update.effective_chat.id
+        db = self.get_db()
+        try:
+            if not context.args:
+                await update.message.reply_text(
+                    "Usage: /delete_note <assignment_name>\n"
+                    "Examples: /delete_note my-homework"
+                )
+                return
+
+            db_user = db.query(User).filter(User.telegram_id == chat_id).first()
+            if not db_user:
+                await update.message.reply_text("Please use /start first.")
+                return
+
+            if (db_user.role or 'student').lower() != 'teacher':
+                await update.message.reply_text(
+                    "Only teachers can delete notes. Use /set_role teacher <password> if you have teacher access."
+                )
+                return
+
+            assignment_name = context.args[0]
+            assignment = db.query(Assignment).filter(
+                and_(
+                    Assignment.user_id == db_user.id,
+                    Assignment.name.ilike(f"%{assignment_name}%")
+                )
+            ).first()
+            if not assignment:
+                await update.message.reply_text(
+                    f"❌ Assignment '{assignment_name}' not found.\n\n"
+                    f"Use /assignments to see your assignments."
+                )
+                return
+            assignment.note = ''
+            db.commit()
+            await update.message.reply_text(
+                f"✅ Note for assignment '{assignment.name}' deleted successfully!"
+            )
+        finally:
+            db.close()
+
     async def set_github_username(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /set_github_username <username>."""
         chat_id = update.effective_chat.id
@@ -1833,6 +1979,8 @@ def main():
     application.add_handler(CommandHandler("set_my_notify_period", bot_instance.set_my_notify_period))
     application.add_handler(CommandHandler("set_role", bot_instance.set_role))
     application.add_handler(CommandHandler("set_github_username", bot_instance.set_github_username))
+    application.add_handler(CommandHandler("add_note", bot_instance.add_note))
+    application.add_handler(CommandHandler("delete_note", bot_instance.delete_note))
     
     # Start the bot
     print("Bot is starting...")
