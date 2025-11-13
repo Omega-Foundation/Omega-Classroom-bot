@@ -584,6 +584,52 @@ class GitHubClient:
             return None
         return "\n".join(messages)
 
+    def get_pull_requests(self, repo_full_name: str, state: str = 'open') -> List[Dict[str, Any]]:
+        """Get pull requests for a repository."""
+        try:
+            repo = self.github.get_repo(repo_full_name)
+            prs = repo.get_pulls(state=state, sort='updated', direction='desc')
+            
+            result = []
+            for pr in list(prs[:20]):  # Limit to 20 most recent
+                labels = [{'name': label.name, 'color': label.color} for label in pr.labels]
+                result.append({
+                    'number': pr.number,
+                    'title': pr.title,
+                    'state': pr.state,
+                    'html_url': pr.html_url,
+                    'user': pr.user.login if pr.user else 'Unknown',
+                    'created_at': pr.created_at,
+                    'updated_at': pr.updated_at,
+                    'labels': labels,
+                })
+            return result
+        except Exception as e:
+            print(f"Error getting pull requests for {repo_full_name}: {e}")
+            return []
+    
+    def get_pr_comments(self, repo_full_name: str, pr_number: int) -> List[Dict[str, Any]]:
+        """Get comments for a specific pull request."""
+        try:
+            repo = self.github.get_repo(repo_full_name)
+            issue = repo.get_issue(pr_number)
+            comments = issue.get_comments()
+            
+            result = []
+            for comment in list(comments):
+                result.append({
+                    'id': comment.id,
+                    'user': comment.user.login if comment.user else 'Unknown',
+                    'body': comment.body,
+                    'created_at': comment.created_at,
+                    'updated_at': comment.updated_at,
+                    'html_url': comment.html_url,
+                })
+            return result
+        except Exception as e:
+            print(f"Error getting comments for PR #{pr_number} in {repo_full_name}: {e}")
+            return []
+
     def get_ci_status(self, repo_full_name: str) -> Dict[str, Any]:
         """
         Return GitHub Actions CI status for repository.

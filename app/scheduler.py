@@ -52,6 +52,22 @@ class NotificationScheduler:
             replace_existing=True
         )
         
+        # Schedule PR comment checks (every 5 minutes)
+        self.scheduler.add_job(
+            self.check_pr_comments,
+            trigger=IntervalTrigger(seconds=300),  # 5 minutes
+            id='check_pr_comments',
+            replace_existing=True
+        )
+        
+        # Schedule PR label change checks (every 5 minutes)
+        self.scheduler.add_job(
+            self.check_pr_labels,
+            trigger=IntervalTrigger(seconds=300),  # 5 minutes
+            id='check_pr_labels',
+            replace_existing=True
+        )
+        
         self.scheduler.start()
         print("Notification scheduler started")
     
@@ -67,6 +83,32 @@ class NotificationScheduler:
                 db.close()
         except Exception as e:
             print(f"Error checking deadlines: {e}")
+    
+    async def check_pr_comments(self):
+        """Check for new PR comments."""
+        try:
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                notification_service = NotificationService(self.bot, db)
+                await notification_service.check_pr_messages()
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"Error checking PR comments: {e}")
+    
+    async def check_pr_labels(self):
+        """Check for PR label changes."""
+        try:
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                notification_service = NotificationService(self.bot, db)
+                await notification_service.check_label_change()
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"Error checking PR labels: {e}")
     
     def stop(self):
         """Stop the scheduler."""
