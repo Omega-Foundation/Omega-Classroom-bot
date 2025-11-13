@@ -1,23 +1,20 @@
-"""Scheduler for periodic notification checks."""
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
+"""Scheduler utilities for periodic notification checks."""
+from telegram.ext import Application, ContextTypes
 from telegram import Bot
-from sqlalchemy.orm import Session
 from app.database import get_db, get_or_create_settings, User
 from app.notifications import NotificationService
 from app.config import Config
 import asyncio
 
 class NotificationScheduler:
-    """Scheduler for periodic notification tasks."""
-    
-    def __init__(self, bot: Bot):
-        self.bot = bot
-        self.scheduler = AsyncIOScheduler()
-    
-    def start(self):
-        """Start the scheduler."""
-        # Read period from DB settings
+    """Scheduler helper that uses Telegram Application's job queue."""
+
+    def __init__(self, application: Application):
+        self.application = application
+        self.job = None
+
+    def _compute_interval_seconds(self) -> int:
+        """Derive poll interval based on global + per-user settings."""
         db_gen = get_db()
         db = next(db_gen)
         try:
@@ -27,48 +24,53 @@ class NotificationScheduler:
                 u.notify_period_seconds for u in db.query(User).all()
                 if u.notify_period_seconds and u.notify_period_seconds > 0
             ]
-            if user_periods:
-                effective_period = min(base_period, min(user_periods))
-            else:
-                effective_period = base_period
+            effective_period = min(user_periods) if user_periods else base_period
         except Exception:
             effective_period = Config.NOTIFICATION_CHECK_INTERVAL
         finally:
             db.close()
 
-        # Ensure scheduler runs at a reasonable cadence
         if not effective_period or effective_period <= 0:
             effective_period = Config.NOTIFICATION_CHECK_INTERVAL
         half_period = int(effective_period / 2)
         if half_period <= 0:
             half_period = int(effective_period)
-        period_seconds = max(15, half_period)
+        return max(15, half_period)
 
-        # Schedule deadline checks
-        self.scheduler.add_job(
-            self.check_deadlines,
-            trigger=IntervalTrigger(seconds=period_seconds),
-            id='check_deadlines',
-            replace_existing=True
+    async def _job_callback(self, context: ContextTypes.DEFAULT_TYPE):
+        """Background job entry point."""
+        await self.check_deadlines(context.bot)
+
+    def start(self):
+        """Register repeating job in Telegram job queue."""
+        interval = self._compute_interval_seconds()
+        if self.job:
+            self.job.schedule_removal()
+        self.job = self.application.job_queue.run_repeating(
+            self._job_callback,
+            interval=interval,
+            first=interval,
+            name="deadline_notifications",
         )
-        
-        self.scheduler.start()
-        print("Notification scheduler started")
-    
-    async def check_deadlines(self):
+        print(f"Notification scheduler started (interval={interval}s)")
+
+    def stop(self):
+        """Remove scheduled job if present."""
+        if self.job:
+            self.job.schedule_removal()
+            self.job = None
+            print("Notification scheduler stopped")
+
+    async def check_deadlines(self, bot: Bot):
         """Check for upcoming deadlines."""
         try:
             db_gen = get_db()
             db = next(db_gen)
             try:
-                notification_service = NotificationService(self.bot, db)
+                notification_service = NotificationService(bot, db)
                 await notification_service.check_upcoming_deadlines()
             finally:
                 db.close()
         except Exception as e:
             print(f"Error checking deadlines: {e}")
-    
-    def stop(self):
-        """Stop the scheduler."""
-        self.scheduler.shutdown()
 

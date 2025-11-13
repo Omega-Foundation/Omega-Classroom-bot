@@ -15,6 +15,7 @@ from typing import Tuple, List, Dict, Optional
 from collections import Counter
 import re
 import json
+from app.scheduler import NotificationScheduler
 
 class HomeworkTrackerBot:
     """Main bot class."""
@@ -2048,9 +2049,14 @@ def main():
     application.add_handler(CommandHandler("add_note", bot_instance.add_note))
     application.add_handler(CommandHandler("delete_note", bot_instance.delete_note))
     
-    # Start the bot
+    # Start the bot with scheduler
+    scheduler = NotificationScheduler(application)
+    scheduler.start()
     print("Bot is starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        scheduler.stop()
 
 if __name__ == '__main__':
     main()
