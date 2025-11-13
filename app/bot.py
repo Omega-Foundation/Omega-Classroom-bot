@@ -333,6 +333,15 @@ class HomeworkTrackerBot:
         """Get database session."""
         db_gen = get_db()
         return next(db_gen)
+
+    def _format_classroom_label(self, raw: Optional[str]) -> str:
+        """Format classroom identifiers into a readable label."""
+        if not raw or not isinstance(raw, str):
+            return ""
+        label = raw.replace('-', ' ').replace('_', ' ').strip()
+        if not label:
+            return ""
+        return label.title()
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command."""
@@ -517,173 +526,226 @@ class HomeworkTrackerBot:
                 )
                 return
 
+            if not db_user.github_token:
+                await update.message.reply_text(
+                    "Please register your GitHub token first:\n"
+                    "/register_token <your_github_token>"
+                )
+                return
+
+            try:
+                github_client = GitHubClient(token=db_user.github_token)
+            except Exception as e:
+                await update.message.reply_text(f"❌ Could not initialise GitHub client: {e}")
+                return
+
+            classroom_assignments: List[Dict] = []
+            classroom_meta: Dict[str, Dict] = {}
+            fetch_error: Optional[str] = None
+
+            try:
+                classroom_assignments = github_client.get_classroom_assignments(db_user.github_username)
+            except Exception as e:
+                fetch_error = str(e)
+            else:
+                for item in classroom_assignments:
+                    assignment_name = (item.get('name') or item.get('title') or 'Classroom Assignment').strip()
+                    classroom_id = item.get('classroom_id')
+                    assignment_id = item.get('assignment_id')
+                    assignment_id_str = str(assignment_id) if assignment_id is not None else None
+                    classroom_id_str = str(classroom_id) if classroom_id is not None else None
+
+                    if assignment_id_str:
+                        classroom_meta[assignment_id_str] = item
+
+                    deadline_dt = self._parse_datetime(item.get('deadline')) or datetime.utcnow()
+                    repo_url = (item.get('url') or '').strip()
+                    repo_name = github_client.parse_repo_url(repo_url) if repo_url else assignment_name
+
+                    query = db.query(Assignment).filter(Assignment.user_id == db_user.id)
+                    if assignment_id_str:
+                        query = query.filter(Assignment.classroom_assignment_id == assignment_id_str)
+                    else:
+                        query = query.filter(Assignment.name == assignment_name)
+                    assignment_db = query.first()
+
+                    changed = False
+                    if not assignment_db:
+                        assignment_db = Assignment(
+                            name=assignment_name,
+                            description=item.get('description'),
+                            github_repo_name=repo_name or assignment_name,
+                            github_repo_url=repo_url,
+                            deadline=deadline_dt,
+                            classroom_id=classroom_id_str,
+                            classroom_assignment_id=assignment_id_str,
+                            user_id=db_user.id,
+                        )
+                        db.add(assignment_db)
+                        db.flush()
+                        changed = True
+                    else:
+                        if item.get('description') and assignment_db.description != item.get('description'):
+                            assignment_db.description = item.get('description')
+                            changed = True
+                        if repo_url and assignment_db.github_repo_url != repo_url:
+                            assignment_db.github_repo_url = repo_url
+                            changed = True
+                        if repo_name and assignment_db.github_repo_name != repo_name:
+                            assignment_db.github_repo_name = repo_name
+                            changed = True
+                        if classroom_id_str and assignment_db.classroom_id != classroom_id_str:
+                            assignment_db.classroom_id = classroom_id_str
+                            changed = True
+                        if assignment_id_str and assignment_db.classroom_assignment_id != assignment_id_str:
+                            assignment_db.classroom_assignment_id = assignment_id_str
+                            changed = True
+                        if deadline_dt and assignment_db.deadline != deadline_dt:
+                            assignment_db.deadline = deadline_dt
+                            changed = True
+
+                    submission = next((s for s in assignment_db.submissions or [] if s.user_id == db_user.id), None)
+                    if not submission:
+                        submission = Submission(
+                            assignment_id=assignment_db.id,
+                            user_id=db_user.id,
+                            github_repo_url=repo_url or assignment_db.github_repo_url,
+                        )
+                        db.add(submission)
+                        changed = True
+                    else:
+                        if repo_url and submission.github_repo_url != repo_url:
+                            submission.github_repo_url = repo_url
+                            submission.updated_at = datetime.utcnow()
+                            changed = True
+
+                    if changed:
+                        db.commit()
+                        db.refresh(assignment_db)
+
             assignments = (
                 db.query(Assignment)
                 .options(joinedload(Assignment.user), joinedload(Assignment.submissions))
-                .filter(
-                    Assignment.submissions.any(
-                        Submission.user_id == db_user.id
-                    )
-                )
-                .order_by(Assignment.deadline)
+                .filter(Assignment.user_id == db_user.id)
+                .order_by(Assignment.deadline, Assignment.name)
                 .all()
             )
+
+            class_ids = {a.classroom_assignment_id for a in assignments if a.classroom_assignment_id}
+            teacher_map: Dict[str, str] = {}
+            classroom_teacher_map: Dict[str, str] = {}
+            if class_ids:
+                class_id_list = [cid for cid in class_ids if cid]
+                if class_id_list:
+                    teacher_assignments = (
+                        db.query(Assignment)
+                        .options(joinedload(Assignment.user))
+                        .filter(
+                            Assignment.classroom_assignment_id.in_(class_id_list),
+                            Assignment.user_id != db_user.id
+                        )
+                        .all()
+                    )
+                    for teacher_assignment in teacher_assignments:
+                        if teacher_assignment.classroom_assignment_id and teacher_assignment.user:
+                            teacher_user = teacher_assignment.user
+                            teacher_name = teacher_user.first_name or teacher_user.username or teacher_user.github_username or ""
+                            if teacher_name:
+                                teacher_map[str(teacher_assignment.classroom_assignment_id)] = teacher_name
+
+                    classroom_records = (
+                        db.query(ClassroomAssignmentRecord)
+                        .options(joinedload(ClassroomAssignmentRecord.teacher))
+                        .filter(ClassroomAssignmentRecord.assignment_id.in_(class_id_list))
+                        .all()
+                    )
+                    for record in classroom_records:
+                        record_key = record.assignment_id or ""
+                        if not record_key:
+                            continue
+                        teacher_entity = record.teacher
+                        teacher_name = ""
+                        if teacher_entity:
+                            teacher_name = teacher_entity.first_name or teacher_entity.username or teacher_entity.github_username or ""
+                        if not teacher_name:
+                            teacher_name = self._format_classroom_label(record.classroom_name)
+                        if teacher_name:
+                            classroom_teacher_map.setdefault(str(record_key), teacher_name)
 
             entries: List[Dict] = []
-            username_lower = db_user.github_username.lower()
-
-            def add_entry(data: Dict):
-                entry = dict(data)
-                entry.setdefault('note', '')
-                entries.append(entry)
-
             seen_keys = set()
-            assignment_note_lookup: Dict[str, str] = {}
-            assignment_title_lookup: Dict[str, str] = {}
+            now = datetime.utcnow()
 
-            if assignments:
-                now = datetime.utcnow()
-                for assignment in assignments:
-                    submission = next((s for s in assignment.submissions or [] if s.user_id == db_user.id), None)
-                    repo_url = assignment.github_repo_url or assignment.github_repo_name or ''
-                    teacher = assignment.user
-                    teacher_name = ""
-                    if teacher:
-                        teacher_name = teacher.first_name or teacher.username or teacher.github_username or ""
-                    if submission and submission.github_repo_url:
-                        repo_url = submission.github_repo_url
-
-                    deadline = assignment.deadline if isinstance(assignment.deadline, datetime) else None
-                    status = "ℹ️"
-                    time_remaining = ""
-                    if deadline:
-                        if deadline > now:
-                            status = "⏰ Active"
-                            delta = deadline - now
-                            time_remaining = f" ({delta.days}d {delta.seconds // 3600}h remaining)"
-                        else:
-                            status = "✅ Past"
-
-                    submission_status = None
-                    submitted_at_str = None
-                    if submission:
-                        submission_status = "Submitted" if submission.is_submitted else "In progress"
-                        if submission.submitted_at:
-                            submitted_at = submission.submitted_at
-                            if isinstance(submitted_at, datetime):
-                                submitted_at_str = submitted_at.strftime('%Y-%m-%d %H:%M:%S UTC')
-
-                    key_identifier = assignment.classroom_assignment_id or assignment.id or assignment.name or ''
-                    key = (str(key_identifier), teacher_name)
-                    seen_keys.add(key)
-
-                    note_value = (assignment.note or '').strip()
-
-                    add_entry({
-                        'name': assignment.name,
-                        'deadline': deadline,
-                        'repo_url': repo_url,
-                        'teacher': teacher_name,
-                        'status': status,
-                        'time_remaining': time_remaining,
-                        'submission_status': submission_status,
-                        'submitted_at': submitted_at_str,
-                        'source': 'Submission',
-                        'note': note_value,
-                    })
-
-                    if assignment.classroom_assignment_id:
-                        assignment_note_lookup[str(assignment.classroom_assignment_id)] = note_value
-                    if assignment.id is not None:
-                        assignment_note_lookup[str(assignment.id)] = note_value
-                    if assignment.name:
-                        assignment_title_lookup[assignment.name.lower()] = note_value
-
-            classroom_records = (
-                db.query(ClassroomAssignmentRecord)
-                .options(joinedload(ClassroomAssignmentRecord.teacher))
-                .filter(
-                    or_(
-                        func.lower(ClassroomAssignmentRecord.student_login) == username_lower,
-                        func.lower(ClassroomAssignmentRecord.student_display_login) == username_lower
-                    )
-                )
-                .order_by(ClassroomAssignmentRecord.deadline, ClassroomAssignmentRecord.assignment_title)
-                .all()
-            )
-
-            for record in classroom_records:
-                teacher = record.teacher
-                teacher_name = ""
-                if teacher:
-                    teacher_name = teacher.first_name or teacher.username or teacher.github_username or ""
-                record_identifier = record.assignment_id or record.assignment_title or ''
-                key = (str(record_identifier), teacher_name)
+            for assignment in assignments:
+                key_identifier = assignment.classroom_assignment_id or assignment.id or assignment.name or ''
+                key = str(key_identifier).lower()
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
 
-                repo_url = record.student_repo_url or record.assignment_url or ''
-                deadline = record.deadline if isinstance(record.deadline, datetime) else None
+                submission = next((s for s in assignment.submissions or [] if s.user_id == db_user.id), None)
+                repo_url = ''
+                if submission and submission.github_repo_url:
+                    repo_url = submission.github_repo_url
+                else:
+                    repo_url = assignment.github_repo_url or assignment.github_repo_name or ''
+
+                deadline = assignment.deadline if isinstance(assignment.deadline, datetime) else None
                 status = "ℹ️"
                 time_remaining = ""
                 if deadline:
-                    if deadline > datetime.utcnow():
-                        delta = deadline - datetime.utcnow()
+                    if deadline > now:
+                        delta = deadline - now
                         status = "⏰ Active"
                         time_remaining = f" ({delta.days}d {delta.seconds // 3600}h remaining)"
                     else:
                         status = "✅ Past"
 
                 submission_status = None
-                if record.submitted is not None:
-                    submission_status = "Submitted" if record.submitted else "In progress"
+                submitted_at_str = None
+                if submission:
+                    if submission.is_submitted is not None:
+                        submission_status = "Submitted" if submission.is_submitted else "In progress"
+                    if submission.submitted_at and isinstance(submission.submitted_at, datetime):
+                        submitted_at_str = submission.submitted_at.strftime('%Y-%m-%d %H:%M:%S UTC')
 
-                note_value = ''
-                if record.assignment_id:
-                    note_value = assignment_note_lookup.get(str(record.assignment_id), '')
-                if not note_value and record.assignment_title:
-                    note_value = assignment_title_lookup.get(record.assignment_title.lower(), '')
-                if not note_value and record.assignment_id:
-                    assignment_id_str = str(record.assignment_id)
-                    linked_assignment = (
-                        db.query(Assignment)
-                        .filter(Assignment.classroom_assignment_id == assignment_id_str)
-                        .first()
-                    )
-                    if not linked_assignment and assignment_id_str.isdigit():
-                        linked_assignment = (
-                            db.query(Assignment)
-                            .filter(Assignment.id == int(assignment_id_str))
-                            .first()
-                        )
-                    if linked_assignment:
-                        note_value = (linked_assignment.note or '').strip()
-                        if linked_assignment.classroom_assignment_id:
-                            assignment_note_lookup[str(linked_assignment.classroom_assignment_id)] = note_value
-                        if linked_assignment.id is not None:
-                            assignment_note_lookup[str(linked_assignment.id)] = note_value
-                        if linked_assignment.name:
-                            assignment_title_lookup[linked_assignment.name.lower()] = note_value
+                teacher_name = ""
+                if assignment.classroom_assignment_id:
+                    teacher_name = teacher_map.get(str(assignment.classroom_assignment_id), "")
+                    if not teacher_name:
+                        teacher_name = classroom_teacher_map.get(str(assignment.classroom_assignment_id), "")
+                    if not teacher_name:
+                        meta = classroom_meta.get(str(assignment.classroom_assignment_id))
+                        if meta:
+                            teacher_name = self._format_classroom_label(meta.get('classroom_name'))
+                elif assignment.user and assignment.user.id != db_user.id:
+                    teacher_user = assignment.user
+                    teacher_name = teacher_user.first_name or teacher_user.username or teacher_user.github_username or ""
 
-                add_entry({
-                    'name': record.assignment_title or 'Classroom Assignment',
+                source_label = "Classroom" if assignment.classroom_assignment_id else "Saved"
+
+                entries.append({
+                    'name': assignment.name,
                     'deadline': deadline,
                     'repo_url': repo_url,
                     'teacher': teacher_name,
                     'status': status,
                     'time_remaining': time_remaining,
                     'submission_status': submission_status,
-                    'submitted_at': None,
-                    'source': 'Classroom Snapshot',
-                    'note': note_value,
+                    'submitted_at': submitted_at_str,
+                    'source': source_label,
+                    'note': (assignment.note or '').strip(),
                 })
 
             if not entries:
-                await update.message.reply_text(
-                    "No assignments found.\n"
+                message_lines = [
+                    "No assignments found.",
                     "You can add assignments with: /add_assignment"
-                )
+                ]
+                if fetch_error:
+                    message_lines.append("")
+                    message_lines.append(f"⚠️ GitHub Classroom fetch failed: {fetch_error}")
+                await update.message.reply_text("\n".join(message_lines))
             else:
                 entries.sort(key=lambda e: (e['deadline'] or datetime.max, e['name']))
                 lines: List[str] = []
@@ -701,13 +763,17 @@ class HomeworkTrackerBot:
                     if entry['submitted_at']:
                         lines.append(f"Submitted at: {entry['submitted_at']}")
                     lines.append(f"Source: {entry['source']}")
-                    note_value = (entry.get('note') or '').strip()
+                    note_value = entry.get('note') or ''
+                    note_value = note_value.strip()
                     if note_value:
                         lines.append("")
                         lines.append(f"Note: {note_value}")
                     lines.append("")
 
-                await update.message.reply_text("\n".join(lines).strip())
+                output_text = "\n".join(lines).strip()
+                if fetch_error:
+                    output_text += f"\n\n⚠️ GitHub Classroom fetch failed: {fetch_error}"
+                await update.message.reply_text(output_text)
         finally:
             db.close()
 

@@ -3,7 +3,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from telegram import Bot
 from sqlalchemy.orm import Session
-from app.database import get_db, get_or_create_settings
+from app.database import get_db, get_or_create_settings, User
 from app.notifications import NotificationService
 from app.config import Config
 import asyncio
@@ -22,11 +22,27 @@ class NotificationScheduler:
         db = next(db_gen)
         try:
             settings = get_or_create_settings(db)
-            period_seconds = settings.notify_period_seconds
+            base_period = settings.notify_period_seconds or Config.NOTIFICATION_CHECK_INTERVAL
+            user_periods = [
+                u.notify_period_seconds for u in db.query(User).all()
+                if u.notify_period_seconds and u.notify_period_seconds > 0
+            ]
+            if user_periods:
+                effective_period = min(base_period, min(user_periods))
+            else:
+                effective_period = base_period
         except Exception:
-            period_seconds = Config.NOTIFICATION_CHECK_INTERVAL
+            effective_period = Config.NOTIFICATION_CHECK_INTERVAL
         finally:
             db.close()
+
+        # Ensure scheduler runs at a reasonable cadence
+        if not effective_period or effective_period <= 0:
+            effective_period = Config.NOTIFICATION_CHECK_INTERVAL
+        half_period = int(effective_period / 2)
+        if half_period <= 0:
+            half_period = int(effective_period)
+        period_seconds = max(15, half_period)
 
         # Schedule deadline checks
         self.scheduler.add_job(

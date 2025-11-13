@@ -1,7 +1,7 @@
 """Notification system for deadlines."""
 from datetime import datetime, timedelta
-from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import and_, or_
 from app.database import Assignment, Submission, User, Notification, AppSettings, get_or_create_settings
 from app.github_client import GitHubClient
 from telegram import Bot
@@ -30,13 +30,23 @@ class NotificationService:
             warning_time = now + timedelta(hours=threshold_hours)
 
             # Only consider this user's assignments
-            upcoming = self.db.query(Assignment).filter(
-                and_(
-                    Assignment.user_id == user.id,
-                    Assignment.deadline <= warning_time,
-                    Assignment.deadline > now
+            upcoming = (
+                self.db.query(Assignment)
+                .options(joinedload(Assignment.submissions))
+                .outerjoin(Submission, Submission.assignment_id == Assignment.id)
+                .filter(
+                    and_(
+                        Assignment.deadline <= warning_time,
+                        Assignment.deadline > now,
+                        or_(
+                            Assignment.user_id == user.id,
+                            Submission.user_id == user.id
+                        )
+                    )
                 )
-            ).all()
+                .distinct()
+                .all()
+            )
 
             for assignment in upcoming:
                 # Check last notification time for this user/assignment
@@ -64,12 +74,22 @@ class NotificationService:
                 hours = int(hours_until_deadline % 24)
                 time_remaining = f"{days}d {hours}h" if days > 0 else f"{hours}h"
 
+                submission = next(
+                    (s for s in assignment.submissions or [] if s.user_id == user.id),
+                    None
+                )
+                repo_ref = ''
+                if submission and submission.github_repo_url:
+                    repo_ref = submission.github_repo_url
+                else:
+                    repo_ref = assignment.github_repo_url or assignment.github_repo_name or ''
+
                 message = (
                     f"⏰ Deadline Reminder\n\n"
                     f"Assignment: {assignment.name}\n"
                     f"Deadline: {assignment.deadline.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
                     f"Time remaining: {time_remaining}\n"
-                    f"Repository: {assignment.github_repo_url or assignment.github_repo_name}"
+                    f"Repository: {repo_ref}"
                 )
 
                 try:
